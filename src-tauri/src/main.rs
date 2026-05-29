@@ -1,8 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::Serialize;
+use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const DEEPSEEK_ENV_VARS: &[(&str, &str)] = &[
     ("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
@@ -15,6 +18,9 @@ const DEEPSEEK_ENV_VARS: &[(&str, &str)] = &[
 ];
 
 const AUTH_TOKEN_ENV_VAR: &str = "ANTHROPIC_AUTH_TOKEN";
+const CLAUDE_COMPAT_VERSION: &str = "2.1.148";
+const CLAUDE_PACKAGE: &str = "@anthropic-ai/claude-code";
+const CLAUDE_AUTOUPDATER_ENV_VAR: &str = "DISABLE_AUTOUPDATER";
 
 #[derive(Serialize)]
 struct ToolCheck {
@@ -40,21 +46,69 @@ struct CommandResult {
     output: Option<String>,
 }
 
+async fn run_blocking<F>(task: F) -> CommandResult
+where
+    F: FnOnce() -> CommandResult + Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(error) => CommandResult {
+            success: false,
+            message: "后台任务执行失败".to_string(),
+            output: Some(error.to_string()),
+        },
+    }
+}
+
 fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
         .output()
         .map_err(|error| format!("无法执行 {program}: {error}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let combined = if stderr.is_empty() {
-        stdout
-    } else if stdout.is_empty() {
-        stderr
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
+    command_result_from_output(program, output)
+}
+
+fn command_output_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法执行 {program}: {error}"))?;
+
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|error| format!("读取 {program} 输出失败: {error}"))?;
+                return command_result_from_output(program, output);
+            }
+            Ok(None) => {
+                if started_at.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .map_err(|error| format!("{program} 执行超时，且读取输出失败: {error}"))?;
+                    let details = command_text_from_output(&output);
+                    return Err(if details.trim().is_empty() {
+                        format!("{program} 执行超时")
+                    } else {
+                        format!("{program} 执行超时\n{details}")
+                    });
+                }
+
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(format!("检查 {program} 执行状态失败: {error}")),
+        }
+    }
+}
+
+fn command_result_from_output(program: &str, output: Output) -> Result<String, String> {
+    let combined = command_text_from_output(&output);
 
     if output.status.success() {
         Ok(combined)
@@ -64,6 +118,18 @@ fn command_output(program: &str, args: &[&str]) -> Result<String, String> {
         } else {
             combined
         })
+    }
+}
+
+fn command_text_from_output(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
     }
 }
 
@@ -121,27 +187,53 @@ fn check_npm() -> ToolCheck {
 
 fn check_claude() -> ToolCheck {
     match command_output("cmd", &["/C", "claude", "--version"]) {
-        Ok(version) => ToolCheck {
-            installed: true,
-            version: Some(version.clone()),
-            meets_requirement: None,
-            message: format!("已安装 {version}"),
-        },
+        Ok(version) => {
+            let path_check = claude_tool_check(version);
+            if path_check.meets_requirement != Some(false) {
+                return path_check;
+            }
+
+            match command_output_from_candidates(&claude_candidates(), &["--version"]) {
+                Ok(candidate_version) => {
+                    let candidate_check = claude_tool_check(candidate_version);
+                    if candidate_check.meets_requirement != Some(false) {
+                        candidate_check
+                    } else {
+                        path_check
+                    }
+                }
+                Err(_) => path_check,
+            }
+        }
         Err(path_error) => match command_output_from_candidates(&claude_candidates(), &["--version"]) {
-            Ok(version) => ToolCheck {
-                installed: true,
-                version: Some(version.clone()),
-                meets_requirement: None,
-                message: format!("已安装 {version}"),
-            },
+            Ok(version) => claude_tool_check(version),
             Err(candidate_error) => ToolCheck {
                 installed: false,
                 version: None,
-                meets_requirement: None,
+                meets_requirement: Some(false),
                 message: format!("{path_error}\n{candidate_error}"),
             },
         },
     }
+}
+
+fn claude_tool_check(version: String) -> ToolCheck {
+    let compatible = is_compatible_claude_version(&version);
+
+    ToolCheck {
+        installed: true,
+        version: Some(version.clone()),
+        meets_requirement: Some(compatible),
+        message: if compatible {
+            format!("已安装 {version}")
+        } else {
+            format!("已安装 {version}，但 DeepSeek 当前兼容版本需要 {CLAUDE_COMPAT_VERSION}")
+        },
+    }
+}
+
+fn is_compatible_claude_version(version: &str) -> bool {
+    version.contains(CLAUDE_COMPAT_VERSION)
 }
 
 fn parse_major_version(version: &str) -> Option<u64> {
@@ -185,8 +277,8 @@ fn check_environment() -> EnvironmentStatus {
 }
 
 #[tauri::command]
-fn install_claude() -> CommandResult {
-    install_claude_native()
+async fn install_claude() -> CommandResult {
+    run_blocking(install_claude_native).await
 }
 
 fn install_claude_native() -> CommandResult {
@@ -195,15 +287,29 @@ fn install_claude_native() -> CommandResult {
     }
 
     let mut log = Vec::new();
-    let native_result = command_output(
+    if let Err(error) = write_user_env_var(CLAUDE_AUTOUPDATER_ENV_VAR, "1") {
+        return CommandResult {
+            success: false,
+            message: format!("写入 {CLAUDE_AUTOUPDATER_ENV_VAR} 失败"),
+            output: Some(error),
+        };
+    }
+    std::env::set_var(CLAUDE_AUTOUPDATER_ENV_VAR, "1");
+    log.push("已禁用 Claude Code 自动更新，避免自动升级到 DeepSeek 暂不兼容版本。".to_string());
+
+    let native_install_command = format!(
+        "& ([scriptblock]::Create((Invoke-RestMethod 'https://claude.ai/install.ps1'))) {CLAUDE_COMPAT_VERSION}"
+    );
+    let native_result = command_output_with_timeout(
         "powershell.exe",
         &[
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            "& ([scriptblock]::Create((Invoke-RestMethod 'https://claude.ai/install.ps1')))",
+            &native_install_command,
         ],
+        Duration::from_secs(180),
     );
 
     match native_result {
@@ -214,15 +320,18 @@ fn install_claude_native() -> CommandResult {
 
             refresh_process_path_from_registry();
             let check = check_claude();
-            if check.installed {
+            if check.installed && check.meets_requirement != Some(false) {
                 return CommandResult {
                     success: true,
-                    message: "Claude Code 安装完成".to_string(),
+                    message: format!("Claude Code {CLAUDE_COMPAT_VERSION} 安装完成"),
                     output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
                 };
             }
 
-            log.push(format!("官方安装器执行完成，但当前进程还未找到 claude：{}", check.message));
+            log.push(format!(
+                "官方安装器执行完成，但当前 Claude Code 仍未处于兼容版本：{}",
+                check.message
+            ));
         }
         Err(error) => {
             log.push(format!("官方 Windows 安装器失败：{}", bounded_output(error)));
@@ -240,18 +349,20 @@ fn install_claude_native() -> CommandResult {
         };
     }
 
-    match command_output("npm.cmd", &["install", "-g", "@anthropic-ai/claude-code"]) {
+    let package_spec = format!("{CLAUDE_PACKAGE}@{CLAUDE_COMPAT_VERSION}");
+    match command_output_with_timeout("npm.cmd", &["install", "-g", &package_spec], Duration::from_secs(240)) {
         Ok(output) => {
             if !output.trim().is_empty() {
                 log.push(format!("npm 兜底安装输出：\n{}", bounded_output(output)));
             }
 
+            remove_incompatible_claude_binaries(&mut log);
             refresh_process_path_from_registry();
             let check = check_claude();
-            if check.installed {
+            if check.installed && check.meets_requirement != Some(false) {
                 CommandResult {
                     success: true,
-                    message: "Claude Code 安装完成".to_string(),
+                    message: format!("Claude Code {CLAUDE_COMPAT_VERSION} 安装完成"),
                     output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
                 }
             } else {
@@ -275,6 +386,10 @@ fn install_claude_native() -> CommandResult {
 
 #[tauri::command]
 fn configure_deepseek(api_key: String) -> CommandResult {
+    configure_deepseek_internal(api_key)
+}
+
+fn configure_deepseek_internal(api_key: String) -> CommandResult {
     if api_key.trim().is_empty() {
         return CommandResult {
             success: false,
@@ -286,6 +401,15 @@ fn configure_deepseek(api_key: String) -> CommandResult {
     if let Err(error) = ensure_windows() {
         return error;
     }
+
+    if let Err(error) = write_user_env_var(CLAUDE_AUTOUPDATER_ENV_VAR, "1") {
+        return CommandResult {
+            success: false,
+            message: format!("写入 {CLAUDE_AUTOUPDATER_ENV_VAR} 失败"),
+            output: Some(error),
+        };
+    }
+    std::env::set_var(CLAUDE_AUTOUPDATER_ENV_VAR, "1");
 
     for (name, value) in DEEPSEEK_ENV_VARS {
         if let Err(error) = write_user_env_var(name, value) {
@@ -315,7 +439,11 @@ fn configure_deepseek(api_key: String) -> CommandResult {
 }
 
 #[tauri::command]
-fn one_click_setup(api_key: String) -> CommandResult {
+async fn one_click_setup(api_key: String) -> CommandResult {
+    run_blocking(move || one_click_setup_internal(api_key)).await
+}
+
+fn one_click_setup_internal(api_key: String) -> CommandResult {
     if api_key.trim().is_empty() {
         return CommandResult {
             success: false,
@@ -326,7 +454,15 @@ fn one_click_setup(api_key: String) -> CommandResult {
 
     let mut log = Vec::new();
 
-    if !check_claude().installed {
+    let claude_check = check_claude();
+    if !claude_check.installed || claude_check.meets_requirement == Some(false) {
+        if claude_check.installed {
+            log.push(format!(
+                "检测到 {}，将切换到 DeepSeek 当前兼容版本 {CLAUDE_COMPAT_VERSION}",
+                claude_check.message
+            ));
+        }
+
         let install_result = install_claude_native();
         log.push(install_result.message.clone());
 
@@ -342,10 +478,12 @@ fn one_click_setup(api_key: String) -> CommandResult {
             };
         }
     } else {
-        log.push("Claude Code 已安装，跳过安装步骤".to_string());
+        log.push(format!(
+            "Claude Code 已安装且版本兼容（{CLAUDE_COMPAT_VERSION}），跳过安装步骤"
+        ));
     }
 
-    let configure_result = configure_deepseek(api_key);
+    let configure_result = configure_deepseek_internal(api_key);
     log.push(configure_result.message.clone());
 
     if !configure_result.success {
@@ -387,17 +525,19 @@ fn verify_claude() -> CommandResult {
     refresh_process_path_from_registry();
 
     match command_output("cmd", &["/C", "claude", "--version"]) {
-        Ok(output) => CommandResult {
-            success: true,
-            message: "Claude Code 可执行".to_string(),
-            output: Some(output),
-        },
+        Ok(output) => {
+            let result = verify_claude_version_result(output);
+            if result.success {
+                return result;
+            }
+
+            match command_output_from_candidates(&claude_candidates(), &["--version"]) {
+                Ok(candidate_output) => verify_claude_version_result(candidate_output),
+                Err(_) => result,
+            }
+        }
         Err(path_error) => match command_output_from_candidates(&claude_candidates(), &["--version"]) {
-            Ok(output) => CommandResult {
-                success: true,
-                message: "Claude Code 可执行".to_string(),
-                output: Some(output),
-            },
+            Ok(output) => verify_claude_version_result(output),
             Err(candidate_error) => CommandResult {
                 success: false,
                 message: "Claude Code 验证失败".to_string(),
@@ -407,8 +547,28 @@ fn verify_claude() -> CommandResult {
     }
 }
 
+fn verify_claude_version_result(output: String) -> CommandResult {
+    if is_compatible_claude_version(&output) {
+        CommandResult {
+            success: true,
+            message: "Claude Code 可执行且版本兼容".to_string(),
+            output: Some(output),
+        }
+    } else {
+        CommandResult {
+            success: false,
+            message: format!("Claude Code 版本不兼容，需要 {CLAUDE_COMPAT_VERSION}"),
+            output: Some(output),
+        }
+    }
+}
+
 #[tauri::command]
 fn clear_deepseek_config() -> CommandResult {
+    clear_deepseek_config_internal()
+}
+
+fn clear_deepseek_config_internal() -> CommandResult {
     if let Err(error) = ensure_windows() {
         return error;
     }
@@ -424,6 +584,10 @@ fn clear_deepseek_config() -> CommandResult {
         errors.push(format!("{AUTH_TOKEN_ENV_VAR}: {error}"));
     }
 
+    if let Err(error) = delete_user_env_var(CLAUDE_AUTOUPDATER_ENV_VAR) {
+        errors.push(format!("{CLAUDE_AUTOUPDATER_ENV_VAR}: {error}"));
+    }
+
     broadcast_environment_change();
 
     if errors.is_empty() {
@@ -437,6 +601,89 @@ fn clear_deepseek_config() -> CommandResult {
             success: false,
             message: "部分环境变量清除失败".to_string(),
             output: Some(errors.join("\n")),
+        }
+    }
+}
+
+#[tauri::command]
+async fn uninstall_claude_and_deepseek() -> CommandResult {
+    run_blocking(uninstall_claude_and_deepseek_internal).await
+}
+
+fn uninstall_claude_and_deepseek_internal() -> CommandResult {
+    if let Err(error) = ensure_windows() {
+        return error;
+    }
+
+    let mut log = Vec::new();
+    let clear_result = clear_deepseek_config_internal();
+    log.push(clear_result.message.clone());
+    if let Some(output) = clear_result.output {
+        log.push(output);
+    }
+
+    if check_npm().installed {
+        match command_output_with_timeout(
+            "npm.cmd",
+            &["uninstall", "-g", CLAUDE_PACKAGE],
+            Duration::from_secs(120),
+        ) {
+            Ok(output) => {
+                if !output.trim().is_empty() {
+                    log.push(format!("npm 卸载输出：\n{}", bounded_output(output)));
+                } else {
+                    log.push("npm 全局包卸载完成。".to_string());
+                }
+            }
+            Err(error) => {
+                log.push(format!("npm 全局包卸载失败，将继续清理常见安装路径：{}", bounded_output(error)));
+            }
+        }
+    } else {
+        log.push("未检测到 npm，跳过 npm 全局包卸载。".to_string());
+    }
+
+    for path in claude_removal_candidates() {
+        if !path.exists() {
+            continue;
+        }
+
+        match fs::remove_file(&path) {
+            Ok(()) => log.push(format!("已删除 {}", path.display())),
+            Err(error) => log.push(format!("删除 {} 失败：{}", path.display(), error)),
+        }
+    }
+
+    for path in claude_package_dirs() {
+        if !path.exists() {
+            continue;
+        }
+
+        match fs::remove_dir_all(&path) {
+            Ok(()) => log.push(format!("已删除 {}", path.display())),
+            Err(error) => log.push(format!("删除 {} 失败：{}", path.display(), error)),
+        }
+    }
+
+    refresh_process_path_from_registry();
+    let check = check_claude();
+    if check.installed {
+        CommandResult {
+            success: false,
+            message: "DeepSeek 配置已清除，但 Claude Code 未完全卸载".to_string(),
+            output: Some(format!("{}\n\n仍检测到：{}", log.join("\n\n"), check.message)),
+        }
+    } else {
+        let message = if clear_result.success {
+            "Claude Code 与 DeepSeek 配置已卸载"
+        } else {
+            "Claude Code 已卸载，但部分 DeepSeek 配置清除失败"
+        };
+
+        CommandResult {
+            success: clear_result.success,
+            message: message.to_string(),
+            output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
         }
     }
 }
@@ -580,8 +827,9 @@ fn claude_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(appdata) = std::env::var("APPDATA") {
-        candidates.push(PathBuf::from(&appdata).join("npm").join("claude.cmd"));
-        candidates.push(PathBuf::from(appdata).join("npm").join("claude.exe"));
+        let npm_dir = PathBuf::from(appdata).join("npm");
+        candidates.push(npm_dir.join("claude.cmd"));
+        candidates.push(npm_dir.join("claude.exe"));
     }
 
     if let Ok(userprofile) = std::env::var("USERPROFILE") {
@@ -601,8 +849,79 @@ fn claude_candidates() -> Vec<PathBuf> {
     Vec::new()
 }
 
+#[cfg(windows)]
+fn claude_removal_candidates() -> Vec<PathBuf> {
+    let mut candidates = claude_candidates();
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        candidates.push(PathBuf::from(appdata).join("npm").join("claude.ps1"));
+    }
+
+    candidates
+}
+
+#[cfg(not(windows))]
+fn claude_removal_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn claude_package_dirs() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        candidates.push(
+            PathBuf::from(appdata)
+                .join("npm")
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-code"),
+        );
+    }
+
+    candidates
+}
+
+#[cfg(not(windows))]
+fn claude_package_dirs() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn remove_incompatible_claude_binaries(log: &mut Vec<String>) {
+    for path in claude_candidates() {
+        if !path.exists() {
+            continue;
+        }
+
+        match Command::new(&path).arg("--version").output() {
+            Ok(output) if output.status.success() => {
+                let version = command_text_from_output(&output);
+                if is_compatible_claude_version(&version) {
+                    continue;
+                }
+
+                match fs::remove_file(&path) {
+                    Ok(()) => log.push(format!(
+                        "已删除不兼容的 Claude Code：{} ({})",
+                        path.display(),
+                        version
+                    )),
+                    Err(error) => log.push(format!(
+                        "删除不兼容的 Claude Code 失败：{} ({})",
+                        path.display(),
+                        error
+                    )),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => log.push(format!("检查 {} 版本失败：{}", path.display(), error)),
+        }
+    }
+}
+
 fn command_output_from_candidates(paths: &[PathBuf], args: &[&str]) -> Result<String, String> {
     let mut checked = Vec::new();
+    let mut first_success = None;
 
     for path in paths {
         if !path.exists() {
@@ -623,13 +942,26 @@ fn command_output_from_candidates(paths: &[PathBuf], args: &[&str]) -> Result<St
                 };
 
                 if output.status.success() {
-                    return Ok(combined);
+                    if is_compatible_claude_version(&combined) {
+                        return Ok(combined);
+                    }
+
+                    if first_success.is_none() {
+                        first_success = Some(combined.clone());
+                    }
+
+                    checked.push(format!("{}: 版本不兼容 {}", path.display(), combined));
+                    continue;
                 }
 
                 checked.push(format!("{}: {}", path.display(), combined));
             }
             Err(error) => checked.push(format!("{}: {}", path.display(), error)),
         }
+    }
+
+    if let Some(output) = first_success {
+        return Ok(output);
     }
 
     Err(if checked.is_empty() {
@@ -647,7 +979,8 @@ fn main() {
             configure_deepseek,
             one_click_setup,
             verify_claude,
-            clear_deepseek_config
+            clear_deepseek_config,
+            uninstall_claude_and_deepseek
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

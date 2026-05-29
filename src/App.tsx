@@ -44,7 +44,7 @@ function StatusRow({
   label: string;
   check: ToolCheck | { installed: boolean; message: string };
 }) {
-  const ok = check.installed;
+  const ok = check.installed && (!("meets_requirement" in check) || check.meets_requirement !== false);
 
   return (
     <div className="status-row">
@@ -104,6 +104,15 @@ function App() {
     }
   }
 
+  async function uninstallAll() {
+    const confirmed = window.confirm("这会卸载 Claude Code，并清除本机用户级 DeepSeek 配置。是否继续？");
+    if (!confirmed) {
+      return;
+    }
+
+    await runAction("uninstall", "uninstall_claude_and_deepseek");
+  }
+
   useEffect(() => {
     refreshStatus();
   }, []);
@@ -161,13 +170,13 @@ function App() {
             />
           </label>
           <div className="actions">
-            {!status.claude.installed && (
+            {(!status.claude.installed || status.claude.meets_requirement === false) && (
               <button
                 className="secondary-button"
                 onClick={() => runAction("install", "install_claude")}
                 disabled={busy !== null}
               >
-                {busy === "install" ? "安装中" : "安装 Claude Code"}
+                {busy === "install" ? "安装中" : "安装兼容版 Claude Code"}
               </button>
             )}
             <button
@@ -189,7 +198,14 @@ function App() {
               onClick={() => runAction("clear", "clear_deepseek_config")}
               disabled={busy !== null}
             >
-              清除配置
+              {busy === "clear" ? "清除中" : "清除 DeepSeek 配置"}
+            </button>
+            <button
+              className="danger-button"
+              onClick={uninstallAll}
+              disabled={busy !== null}
+            >
+              {busy === "uninstall" ? "卸载中" : "卸载 Claude Code + DeepSeek"}
             </button>
           </div>
         </section>
