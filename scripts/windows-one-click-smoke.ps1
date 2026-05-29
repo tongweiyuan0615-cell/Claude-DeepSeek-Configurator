@@ -18,16 +18,46 @@ $deepseekEnv = [ordered]@{
 function Refresh-ProcessPath {
   $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
   $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-  $env:Path = @($env:Path, $machinePath, $userPath) -join ";"
+  $candidatePaths = @(
+    $env:Path,
+    $machinePath,
+    $userPath,
+    "$env:USERPROFILE\.local\bin",
+    "$env:APPDATA\npm"
+  )
+  $env:Path = ($candidatePaths | Where-Object { $_ }) -join ";"
+}
+
+function Get-ClaudeCandidates {
+  @(
+    "$env:USERPROFILE\.local\bin\claude.exe",
+    "$env:APPDATA\npm\claude.cmd",
+    "$env:APPDATA\npm\claude.exe"
+  )
 }
 
 function Test-ClaudeCommand {
   Refresh-ProcessPath
   $version = cmd.exe /C "claude --version" 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "claude --version failed: $version"
+  if ($LASTEXITCODE -eq 0) {
+    Write-Host "Claude Code version: $version"
+    return
   }
-  Write-Host "Claude Code version: $version"
+
+  foreach ($candidate in Get-ClaudeCandidates) {
+    if (-not (Test-Path $candidate)) {
+      continue
+    }
+
+    $version = & $candidate --version 2>&1
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host "Claude Code version: $version"
+      Write-Host "Claude Code path: $candidate"
+      return
+    }
+  }
+
+  throw "claude --version failed: $version"
 }
 
 function Install-ClaudeCode {
