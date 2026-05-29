@@ -1,0 +1,51 @@
+name: Windows smoke test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - "scripts/windows-one-click-smoke.ps1"
+      - "src-tauri/**"
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/windows-smoke.yml"
+
+jobs:
+  smoke:
+    name: One-click flow on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show initial Claude Code state
+        shell: pwsh
+        run: |
+          $claude = Get-Command claude -ErrorAction SilentlyContinue
+          if ($claude) {
+            Write-Host "::warning::Claude Code is already present on this runner at $($claude.Source)."
+            cmd.exe /C "claude --version"
+          } else {
+            Write-Host "Claude Code is not preinstalled."
+          }
+
+      - name: Run one-click smoke flow
+        shell: pwsh
+        run: ./scripts/windows-one-click-smoke.ps1
+
+      - name: Setup Node.js for frontend build
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build

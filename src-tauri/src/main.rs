@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::Serialize;
+use std::path::PathBuf;
 use std::process::Command;
 
 const DEEPSEEK_ENV_VARS: &[(&str, &str)] = &[
@@ -126,11 +127,19 @@ fn check_claude() -> ToolCheck {
             meets_requirement: None,
             message: format!("已安装 {version}"),
         },
-        Err(error) => ToolCheck {
-            installed: false,
-            version: None,
-            meets_requirement: None,
-            message: error,
+        Err(path_error) => match command_output_from_candidates(&claude_candidates(), &["--version"]) {
+            Ok(version) => ToolCheck {
+                installed: true,
+                version: Some(version.clone()),
+                meets_requirement: None,
+                message: format!("已安装 {version}"),
+            },
+            Err(candidate_error) => ToolCheck {
+                installed: false,
+                version: None,
+                meets_requirement: None,
+                message: format!("{path_error}\n{candidate_error}"),
+            },
         },
     }
 }
@@ -185,7 +194,8 @@ fn install_claude_native() -> CommandResult {
         return error;
     }
 
-    match command_output(
+    let mut log = Vec::new();
+    let native_result = command_output(
         "powershell.exe",
         &[
             "-NoProfile",
@@ -194,17 +204,72 @@ fn install_claude_native() -> CommandResult {
             "-Command",
             "& ([scriptblock]::Create((Invoke-RestMethod 'https://claude.ai/install.ps1')))",
         ],
-    ) {
-        Ok(output) => CommandResult {
-            success: true,
-            message: "Claude Code 安装完成".to_string(),
-            output: Some(bounded_output(output)),
-        },
-        Err(error) => CommandResult {
+    );
+
+    match native_result {
+        Ok(output) => {
+            if !output.trim().is_empty() {
+                log.push(bounded_output(output));
+            }
+
+            refresh_process_path_from_registry();
+            let check = check_claude();
+            if check.installed {
+                return CommandResult {
+                    success: true,
+                    message: "Claude Code 安装完成".to_string(),
+                    output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
+                };
+            }
+
+            log.push(format!("官方安装器执行完成，但当前进程还未找到 claude：{}", check.message));
+        }
+        Err(error) => {
+            log.push(format!("官方 Windows 安装器失败：{}", bounded_output(error)));
+        }
+    }
+
+    if !check_npm().installed {
+        return CommandResult {
             success: false,
             message: "Claude Code 安装失败".to_string(),
-            output: Some(bounded_output(error)),
-        },
+            output: Some(format!(
+                "{}\n\n官方安装器不可用，且本机没有可用的 npm 兜底安装路径。",
+                log.join("\n\n")
+            )),
+        };
+    }
+
+    match command_output("npm.cmd", &["install", "-g", "@anthropic-ai/claude-code"]) {
+        Ok(output) => {
+            if !output.trim().is_empty() {
+                log.push(format!("npm 兜底安装输出：\n{}", bounded_output(output)));
+            }
+
+            refresh_process_path_from_registry();
+            let check = check_claude();
+            if check.installed {
+                CommandResult {
+                    success: true,
+                    message: "Claude Code 安装完成".to_string(),
+                    output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
+                }
+            } else {
+                CommandResult {
+                    success: false,
+                    message: "Claude Code 安装后验证失败".to_string(),
+                    output: Some(format!("{}\n\n{}", log.join("\n\n"), check.message)),
+                }
+            }
+        }
+        Err(error) => {
+            log.push(format!("npm 兜底安装失败：{}", bounded_output(error)));
+            CommandResult {
+                success: false,
+                message: "Claude Code 安装失败".to_string(),
+                output: Some(log.join("\n\n")),
+            }
+        }
     }
 }
 
@@ -319,16 +384,25 @@ fn one_click_setup(api_key: String) -> CommandResult {
 
 #[tauri::command]
 fn verify_claude() -> CommandResult {
+    refresh_process_path_from_registry();
+
     match command_output("cmd", &["/C", "claude", "--version"]) {
         Ok(output) => CommandResult {
             success: true,
             message: "Claude Code 可执行".to_string(),
             output: Some(output),
         },
-        Err(error) => CommandResult {
-            success: false,
-            message: "Claude Code 验证失败".to_string(),
-            output: Some(error),
+        Err(path_error) => match command_output_from_candidates(&claude_candidates(), &["--version"]) {
+            Ok(output) => CommandResult {
+                success: true,
+                message: "Claude Code 可执行".to_string(),
+                output: Some(output),
+            },
+            Err(candidate_error) => CommandResult {
+                success: false,
+                message: "Claude Code 验证失败".to_string(),
+                output: Some(format!("{path_error}\n{candidate_error}")),
+            },
         },
     }
 }
@@ -386,6 +460,22 @@ fn read_user_env_var(name: &str) -> Option<String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let env = hkcu.open_subkey("Environment").ok()?;
     env.get_value::<String, _>(name).ok()
+}
+
+#[cfg(windows)]
+fn read_machine_env_var(name: &str) -> Option<String> {
+    use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let env = hklm
+        .open_subkey("SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment")
+        .ok()?;
+    env.get_value::<String, _>(name).ok()
+}
+
+#[cfg(not(windows))]
+fn read_machine_env_var(_name: &str) -> Option<String> {
+    None
 }
 
 #[cfg(not(windows))]
@@ -460,6 +550,94 @@ fn broadcast_environment_change() {
 
 #[cfg(not(windows))]
 fn broadcast_environment_change() {}
+
+#[cfg(windows)]
+fn refresh_process_path_from_registry() {
+    let mut paths = Vec::new();
+
+    if let Ok(current) = std::env::var("PATH") {
+        paths.push(current);
+    }
+
+    if let Some(machine_path) = read_machine_env_var("Path") {
+        paths.push(machine_path);
+    }
+
+    if let Some(user_path) = read_user_env_var("Path") {
+        paths.push(user_path);
+    }
+
+    if !paths.is_empty() {
+        std::env::set_var("PATH", paths.join(";"));
+    }
+}
+
+#[cfg(not(windows))]
+fn refresh_process_path_from_registry() {}
+
+#[cfg(windows)]
+fn claude_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        candidates.push(PathBuf::from(&appdata).join("npm").join("claude.cmd"));
+        candidates.push(PathBuf::from(appdata).join("npm").join("claude.exe"));
+    }
+
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        candidates.push(PathBuf::from(userprofile).join(".local").join("bin").join("claude.exe"));
+    }
+
+    if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(&localappdata).join("Programs").join("Claude").join("claude.exe"));
+        candidates.push(PathBuf::from(localappdata).join("Claude").join("claude.exe"));
+    }
+
+    candidates
+}
+
+#[cfg(not(windows))]
+fn claude_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn command_output_from_candidates(paths: &[PathBuf], args: &[&str]) -> Result<String, String> {
+    let mut checked = Vec::new();
+
+    for path in paths {
+        if !path.exists() {
+            checked.push(format!("未找到 {}", path.display()));
+            continue;
+        }
+
+        match Command::new(path).args(args).output() {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let combined = if stderr.is_empty() {
+                    stdout
+                } else if stdout.is_empty() {
+                    stderr
+                } else {
+                    format!("{stdout}\n{stderr}")
+                };
+
+                if output.status.success() {
+                    return Ok(combined);
+                }
+
+                checked.push(format!("{}: {}", path.display(), combined));
+            }
+            Err(error) => checked.push(format!("{}: {}", path.display(), error)),
+        }
+    }
+
+    Err(if checked.is_empty() {
+        "未找到 Claude Code 常见安装路径".to_string()
+    } else {
+        checked.join("\n")
+    })
+}
 
 fn main() {
     tauri::Builder::default()
