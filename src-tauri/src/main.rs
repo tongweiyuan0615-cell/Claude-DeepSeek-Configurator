@@ -551,6 +551,7 @@ fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandR
         log.push(format!(
             "Claude Code 已安装且版本兼容（{CLAUDE_COMPAT_VERSION}），跳过安装步骤"
         ));
+        remove_incompatible_claude_binaries(&mut log);
     }
 
     let configure_result = configure_deepseek_internal(api_key);
@@ -1121,6 +1122,10 @@ fn claude_candidates() -> Vec<PathBuf> {
 #[cfg(windows)]
 fn claude_removal_candidates() -> Vec<PathBuf> {
     let mut candidates = claude_candidates();
+
+    if let Ok(prefix) = managed_claude_prefix_dir() {
+        candidates.push(prefix.join("claude.ps1"));
+    }
 
     if let Ok(appdata) = std::env::var("APPDATA") {
         candidates.push(PathBuf::from(appdata).join("npm").join("claude.ps1"));

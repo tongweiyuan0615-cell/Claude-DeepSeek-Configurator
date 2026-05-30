@@ -1,6 +1,6 @@
 [package]
 name = "deepseek_claude_configurator"
-version = "0.1.2"
+version = "0.1.3"
 description = "Claude Code + DeepSeek V4 Windows configurator"
 authors = ["ytw"]
 edition = "2021"
