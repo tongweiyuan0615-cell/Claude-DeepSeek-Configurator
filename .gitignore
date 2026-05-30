@@ -4,4 +4,16 @@ src-tauri/target
 src-tauri/gen
 src-tauri/resources/node/*
 !src-tauri/resources/node/.gitkeep
+windows/node_modules
+windows/dist
+windows/src-tauri/target
+windows/src-tauri/gen
+windows/src-tauri/resources/node/*
+!windows/src-tauri/resources/node/.gitkeep
+macos/node_modules
+macos/dist
+macos/src-tauri/target
+macos/src-tauri/gen
+macos/src-tauri/resources/node/*
+!macos/src-tauri/resources/node/.gitkeep
 *.log

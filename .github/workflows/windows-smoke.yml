@@ -7,17 +7,20 @@ on:
   push:
     branches: [main]
     paths:
-      - "scripts/windows-one-click-smoke.ps1"
-      - "src-tauri/**"
-      - "src/**"
-      - "package.json"
-      - "package-lock.json"
+      - "windows/scripts/windows-one-click-smoke.ps1"
+      - "windows/src-tauri/**"
+      - "windows/src/**"
+      - "windows/package.json"
+      - "windows/package-lock.json"
       - ".github/workflows/windows-smoke.yml"
 
 jobs:
   smoke:
     name: One-click flow on Windows
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
 
     steps:
       - name: Checkout
@@ -43,6 +46,7 @@ jobs:
         with:
           node-version: "20"
           cache: npm
+          cache-dependency-path: windows/package-lock.json
 
       - name: Install frontend dependencies
         run: npm ci

@@ -10,6 +10,9 @@ jobs:
   build:
     name: Build Tauri installer
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
 
     steps:
       - name: Checkout
@@ -20,6 +23,7 @@ jobs:
         with:
           node-version: "20"
           cache: npm
+          cache-dependency-path: windows/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -27,7 +31,7 @@ jobs:
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: windows/src-tauri -> target
 
       - name: Install frontend dependencies
         run: npm ci
@@ -55,4 +59,4 @@ jobs:
         with:
           name: windows-installers
           if-no-files-found: error
-          path: src-tauri/target/release/bundle/msi/*.msi
+          path: windows/src-tauri/target/release/bundle/msi/*.msi
