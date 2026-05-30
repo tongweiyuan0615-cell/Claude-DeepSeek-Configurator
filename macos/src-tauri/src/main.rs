@@ -41,6 +41,7 @@ struct EnvironmentStatus {
     node: ToolCheck,
     npm: ToolCheck,
     claude: ToolCheck,
+    claude_path: ToolCheck,
     deepseek_configured: bool,
     missing_env_vars: Vec<String>,
 }
@@ -283,6 +284,21 @@ fn claude_tool_check(version: String) -> ToolCheck {
     }
 }
 
+fn check_managed_claude() -> ToolCheck {
+    let path_entries = managed_tool_path_entries();
+    prepend_process_path(&path_entries);
+
+    match command_output_from_candidates(&managed_claude_candidates(), &["--version"]) {
+        Ok(version) => claude_tool_check(version),
+        Err(error) => ToolCheck {
+            installed: false,
+            version: None,
+            meets_requirement: Some(false),
+            message: error,
+        },
+    }
+}
+
 fn is_compatible_claude_version(version: &str) -> bool {
     version.contains(CLAUDE_COMPAT_VERSION)
 }
@@ -328,6 +344,7 @@ fn check_environment(app: tauri::AppHandle) -> EnvironmentStatus {
         node: check_node(&app),
         npm: check_npm(&app),
         claude: check_claude(),
+        claude_path: check_claude_path_priority(),
         deepseek_configured,
         missing_env_vars,
     }
@@ -391,7 +408,7 @@ fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
                 log.push(format!("Claude Code 安装输出：\n{}", bounded_output(output)));
             }
 
-            let check = check_claude();
+            let check = check_managed_claude();
             if check.installed && check.meets_requirement != Some(false) {
                 CommandResult {
                     success: true,
@@ -485,8 +502,9 @@ fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandR
 
     let mut log = Vec::new();
 
+    let managed_claude_check = check_managed_claude();
     let claude_check = check_claude();
-    if !claude_check.installed || claude_check.meets_requirement == Some(false) {
+    if !managed_claude_check.installed || managed_claude_check.meets_requirement == Some(false) {
         if claude_check.installed {
             log.push(format!(
                 "检测到 {}，将切换到 DeepSeek 当前兼容版本 {CLAUDE_COMPAT_VERSION}",
@@ -510,7 +528,7 @@ fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandR
         }
     } else {
         log.push(format!(
-            "Claude Code 已安装且版本兼容（{CLAUDE_COMPAT_VERSION}），跳过安装步骤"
+            "本软件管理的 Claude Code 已安装且版本兼容（{CLAUDE_COMPAT_VERSION}），跳过安装步骤"
         ));
     }
 
@@ -537,6 +555,8 @@ fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandR
     }
 
     if verify_result.success {
+        log.push(ensure_managed_claude_priority());
+
         CommandResult {
             success: true,
             message: "一键部署完成。请重新打开 Terminal / iTerm / VS Code 终端。".to_string(),
@@ -1035,6 +1055,90 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn check_claude_path_priority() -> ToolCheck {
+    let Some(path) = first_claude_from_login_shell() else {
+        return ToolCheck {
+            installed: false,
+            version: None,
+            meets_requirement: Some(false),
+            message: "新终端 PATH 还没有命中 claude；一键部署会自动写入本软件管理路径。".to_string(),
+        };
+    };
+
+    let managed = is_managed_claude_path(&path);
+    ToolCheck {
+        installed: true,
+        version: None,
+        meets_requirement: Some(managed),
+        message: if managed {
+            format!("新终端会优先使用本软件管理的 Claude：{}", path.display())
+        } else {
+            format!(
+                "新终端优先命中其他 Claude：{}；一键部署会尝试把本软件管理路径放到最前面。",
+                path.display()
+            )
+        },
+    }
+}
+
+fn ensure_managed_claude_priority() -> String {
+    if let Err(error) = install_shell_profile_link() {
+        return format!("Claude 命令优先级修复失败：{error}");
+    }
+
+    let path_entries = managed_tool_path_entries();
+    prepend_process_path(&path_entries);
+
+    let priority = check_claude_path_priority();
+    if priority.meets_requirement == Some(true) {
+        format!("Claude 命令优先级已确认：{}", priority.message)
+    } else {
+        format!(
+            "Claude 命令优先级提醒：{} 如果客户 shell 配置里还有后续覆盖 PATH 的内容，可能需要手动清理旧 Claude 路径。",
+            priority.message
+        )
+    }
+}
+
+fn first_claude_from_login_shell() -> Option<PathBuf> {
+    let output = command_output(
+        "/bin/zsh",
+        &[
+            "-lc",
+            "printf '__CLAUDE_PATH__%s\\n' \"$(command -v claude 2>/dev/null)\"",
+        ],
+    )
+    .ok()?;
+    let path = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("__CLAUDE_PATH__"))?
+        .trim();
+
+    if path.starts_with('/') {
+        Some(PathBuf::from(path))
+    } else {
+        None
+    }
+}
+
+fn is_managed_claude_path(path: &Path) -> bool {
+    let Ok(prefix) = managed_claude_prefix_dir() else {
+        return false;
+    };
+
+    let path_text = normalize_unix_path_text(&path.to_string_lossy());
+    let prefix_text = normalize_unix_path_text(&prefix.to_string_lossy());
+    path_text == prefix_text || path_text.starts_with(&(prefix_text + "/"))
+}
+
+fn normalize_unix_path_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn install_shell_profile_link() -> Result<(), String> {
     let source_line = format!(
         "{PROFILE_START}\n[ -f \"$HOME/{ENV_FILE_NAME}\" ] && . \"$HOME/{ENV_FILE_NAME}\"\n{PROFILE_END}\n"
@@ -1095,11 +1199,7 @@ fn remove_profile_block(content: &str) -> String {
 }
 
 fn claude_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Ok(prefix) = managed_claude_prefix_dir() {
-        candidates.push(prefix.join("bin").join("claude"));
-    }
+    let mut candidates = managed_claude_candidates();
 
     if let Ok(home) = home_dir() {
         candidates.push(home.join(".local").join("bin").join("claude"));
@@ -1108,6 +1208,16 @@ fn claude_candidates() -> Vec<PathBuf> {
 
     candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
     candidates.push(PathBuf::from("/usr/local/bin/claude"));
+
+    candidates
+}
+
+fn managed_claude_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(prefix) = managed_claude_prefix_dir() {
+        candidates.push(prefix.join("bin").join("claude"));
+    }
 
     candidates
 }

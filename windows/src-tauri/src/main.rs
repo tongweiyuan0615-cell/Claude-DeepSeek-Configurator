@@ -38,6 +38,7 @@ struct EnvironmentStatus {
     node: ToolCheck,
     npm: ToolCheck,
     claude: ToolCheck,
+    claude_path: ToolCheck,
     deepseek_configured: bool,
     missing_env_vars: Vec<String>,
 }
@@ -293,6 +294,21 @@ fn claude_tool_check(version: String) -> ToolCheck {
     }
 }
 
+fn check_managed_claude() -> ToolCheck {
+    let path_entries = managed_tool_path_entries();
+    prepend_process_path(&path_entries);
+
+    match command_output_from_candidates(&managed_claude_candidates(), &["--version"]) {
+        Ok(version) => claude_tool_check(version),
+        Err(error) => ToolCheck {
+            installed: false,
+            version: None,
+            meets_requirement: Some(false),
+            message: error,
+        },
+    }
+}
+
 fn is_compatible_claude_version(version: &str) -> bool {
     version.contains(CLAUDE_COMPAT_VERSION)
 }
@@ -332,6 +348,7 @@ fn check_environment(app: tauri::AppHandle) -> EnvironmentStatus {
         node: check_node(&app),
         npm: check_npm(&app),
         claude: check_claude(),
+        claude_path: check_claude_path_priority(),
         deepseek_configured,
         missing_env_vars,
     }
@@ -419,7 +436,7 @@ fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
 
             remove_incompatible_claude_binaries(&mut log);
             refresh_process_path_from_registry();
-            let check = check_claude();
+            let check = check_managed_claude();
             if check.installed && check.meets_requirement != Some(false) {
                 CommandResult {
                     success: true,
@@ -524,8 +541,9 @@ fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandR
 
     let mut log = Vec::new();
 
+    let managed_claude_check = check_managed_claude();
     let claude_check = check_claude();
-    if !claude_check.installed || claude_check.meets_requirement == Some(false) {
+    if !managed_claude_check.installed || managed_claude_check.meets_requirement == Some(false) {
         if claude_check.installed {
             log.push(format!(
                 "检测到 {}，将切换到 DeepSeek 当前兼容版本 {CLAUDE_COMPAT_VERSION}",
@@ -549,7 +567,7 @@ fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandR
         }
     } else {
         log.push(format!(
-            "Claude Code 已安装且版本兼容（{CLAUDE_COMPAT_VERSION}），跳过安装步骤"
+            "本软件管理的 Claude Code 已安装且版本兼容（{CLAUDE_COMPAT_VERSION}），跳过安装步骤"
         ));
         remove_incompatible_claude_binaries(&mut log);
     }
@@ -577,6 +595,8 @@ fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandR
     }
 
     if verify_result.success {
+        log.push(ensure_managed_claude_priority());
+
         CommandResult {
             success: true,
             message: "一键部署完成。请重新打开 PowerShell / CMD / VS Code 终端。".to_string(),
@@ -808,6 +828,17 @@ fn managed_claude_prefix_dir() -> Result<PathBuf, String> {
     Ok(managed_base_dir()?.join("claude-code"))
 }
 
+fn managed_tool_path_entries() -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    if let Ok(claude_prefix) = managed_claude_prefix_dir() {
+        entries.push(claude_prefix);
+    }
+    if let Ok(node_dir) = managed_node_dir() {
+        entries.push(node_dir);
+    }
+    entries
+}
+
 fn bundled_node_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -952,6 +983,145 @@ fn same_path_text(left: &str, right: &str) -> bool {
         .eq_ignore_ascii_case(right.trim_end_matches(&['\\', '/'][..]))
 }
 
+fn check_claude_path_priority() -> ToolCheck {
+    let Some(path) = first_claude_on_windows_path() else {
+        return ToolCheck {
+            installed: false,
+            version: None,
+            meets_requirement: Some(false),
+            message: "当前终端 PATH 还没有命中 claude；一键部署会自动添加本软件管理路径。".to_string(),
+        };
+    };
+
+    let managed = is_managed_claude_path(&path);
+    ToolCheck {
+        installed: true,
+        version: None,
+        meets_requirement: Some(managed),
+        message: if managed {
+            format!("当前终端会优先使用本软件管理的 Claude：{}", path.display())
+        } else {
+            format!(
+                "当前终端优先命中其他 Claude：{}；一键部署会尝试把本软件管理路径放到最前面。",
+                path.display()
+            )
+        },
+    }
+}
+
+fn ensure_managed_claude_priority() -> String {
+    let mut log = Vec::new();
+
+    for path in managed_tool_path_entries() {
+        if let Err(error) = ensure_user_path_entry_first(&path) {
+            log.push(format!("修复 PATH 优先级失败：{} ({error})", path.display()));
+        }
+    }
+
+    refresh_process_path_from_registry();
+    prepend_process_path(&managed_tool_path_entries());
+
+    let priority = check_claude_path_priority();
+    if priority.meets_requirement == Some(true) {
+        format!("Claude 命令优先级已确认：{}", priority.message)
+    } else {
+        format!(
+            "Claude 命令优先级提醒：{} 如果客户电脑存在系统级 Claude 路径，可能需要管理员手动移除旧路径。",
+            priority.message
+        )
+    }
+}
+
+fn first_claude_on_windows_path() -> Option<PathBuf> {
+    for dir in windows_terminal_path_entries() {
+        for name in ["claude.cmd", "claude.exe", "claude.bat", "claude.ps1"] {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn windows_terminal_path_entries() -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+
+    if let Some(machine_path) = read_machine_env_var("Path") {
+        entries.extend(split_windows_path(&machine_path));
+    }
+
+    if let Some(user_path) = read_user_env_var("Path") {
+        entries.extend(split_windows_path(&user_path));
+    }
+
+    if entries.is_empty() {
+        if let Ok(process_path) = std::env::var("PATH") {
+            entries.extend(split_windows_path(&process_path));
+        }
+    }
+
+    entries
+}
+
+fn split_windows_path(value: &str) -> Vec<PathBuf> {
+    value
+        .split(';')
+        .filter_map(|part| {
+            let trimmed = part.trim().trim_matches('"');
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(expand_windows_env_vars(trimmed)))
+            }
+        })
+        .collect()
+}
+
+fn expand_windows_env_vars(value: &str) -> String {
+    let mut output = String::new();
+    let chars: Vec<char> = value.chars().collect();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '%' {
+            if let Some(end) = chars[index + 1..].iter().position(|ch| *ch == '%') {
+                let name: String = chars[index + 1..index + 1 + end].iter().collect();
+                if let Ok(env_value) = std::env::var(&name) {
+                    output.push_str(&env_value);
+                    index += end + 2;
+                    continue;
+                }
+            }
+        }
+
+        output.push(chars[index]);
+        index += 1;
+    }
+
+    output
+}
+
+fn is_managed_claude_path(path: &PathBuf) -> bool {
+    let Ok(prefix) = managed_claude_prefix_dir() else {
+        return false;
+    };
+
+    let path_text = normalize_path_text(&path.to_string_lossy());
+    let prefix_text = normalize_path_text(&prefix.to_string_lossy());
+    path_text == prefix_text || path_text.starts_with(&(prefix_text + "\\"))
+}
+
+fn normalize_path_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_end_matches(&['\\', '/'][..])
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
 fn prepend_process_path(paths: &[PathBuf]) {
     let mut parts: Vec<String> = paths
         .iter()
@@ -1088,13 +1258,25 @@ fn refresh_process_path_from_registry() {
 fn refresh_process_path_from_registry() {}
 
 #[cfg(windows)]
-fn claude_candidates() -> Vec<PathBuf> {
+fn managed_claude_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(prefix) = managed_claude_prefix_dir() {
         candidates.push(prefix.join("claude.cmd"));
         candidates.push(prefix.join("claude.exe"));
     }
+
+    candidates
+}
+
+#[cfg(not(windows))]
+fn managed_claude_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn claude_candidates() -> Vec<PathBuf> {
+    let mut candidates = managed_claude_candidates();
 
     if let Ok(appdata) = std::env::var("APPDATA") {
         let npm_dir = PathBuf::from(appdata).join("npm");

@@ -12,6 +12,7 @@ type EnvironmentStatus = {
   node: ToolCheck;
   npm: ToolCheck;
   claude: ToolCheck;
+  claude_path: ToolCheck;
   deepseek_configured: boolean;
   missing_env_vars: string[];
 };
@@ -33,6 +34,7 @@ const initialStatus: EnvironmentStatus = {
   node: emptyTool,
   npm: emptyTool,
   claude: emptyTool,
+  claude_path: emptyTool,
   deepseek_configured: false,
   missing_env_vars: [],
 };
@@ -165,6 +167,7 @@ function App() {
             <StatusRow label="内置 Node.js" check={status.node} />
             <StatusRow label="内置 npm" check={status.npm} />
             <StatusRow label="Claude Code" check={status.claude} />
+            <StatusRow label="Claude 命令优先级" check={status.claude_path} />
             <StatusRow
               label="DeepSeek 环境变量"
               check={{
