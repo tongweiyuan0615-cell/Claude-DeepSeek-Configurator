@@ -27,7 +27,7 @@
     "active": true,
     "publisher": "ytw",
     "targets": ["dmg"],
-    "icon": ["icons/icon.icns"],
+    "icon": ["icons/icon.png", "icons/icon.icns"],
     "resources": ["resources/node"]
   }
 }
