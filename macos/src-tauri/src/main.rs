@@ -206,7 +206,8 @@ fn check_node(app: &tauri::AppHandle) -> ToolCheck {
 fn check_npm(app: &tauri::AppHandle) -> ToolCheck {
     if let Ok(node_dir) = managed_node_dir() {
         let npm = node_dir.join("bin").join("npm");
-        if npm.exists() {
+        if npm.exists() && npm_cli_path(&node_dir).exists() {
+            let _ = repair_node_npm_launchers(&node_dir);
             return match command_output(&npm.to_string_lossy(), &["--version"]) {
                 Ok(version) => ToolCheck {
                     installed: true,
@@ -639,6 +640,7 @@ fn one_click_uninstall_internal() -> CommandResult {
     if let (Ok(node_dir), Ok(claude_prefix)) = (managed_node_dir(), managed_claude_prefix_dir()) {
         let npm = node_dir.join("bin").join("npm");
         if npm.exists() {
+            let _ = repair_node_npm_launchers(&node_dir);
             prepend_process_path(&[node_dir.join("bin")]);
             let npm_program = npm.to_string_lossy().to_string();
             let prefix_arg = claude_prefix.to_string_lossy().to_string();
@@ -748,13 +750,14 @@ fn bundled_node_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
 
     candidates
         .into_iter()
-        .find(|path| path.join("bin").join("npm").exists() && path.join("bin").join("node").exists())
+        .find(|path| path.join("bin").join("node").exists() && npm_cli_path(path).exists())
 }
 
 fn ensure_node_runtime(app: &tauri::AppHandle, log: &mut Vec<String>) -> Result<PathBuf, String> {
     let target = managed_node_dir()?;
-    if target.join("bin").join("npm").exists() && target.join("bin").join("node").exists() {
+    if target.join("bin").join("node").exists() && npm_cli_path(&target).exists() {
         make_node_runtime_executable(&target)?;
+        repair_node_npm_launchers(&target)?;
         return Ok(target);
     }
 
@@ -775,6 +778,7 @@ fn ensure_node_runtime(app: &tauri::AppHandle, log: &mut Vec<String>) -> Result<
 
     copy_dir_all(&source, &target)?;
     make_node_runtime_executable(&target)?;
+    repair_node_npm_launchers(&target)?;
     log.push(format!("已启用内置 Node.js v{NODE_RUNTIME_VERSION}。"));
     Ok(target)
 }
@@ -824,6 +828,73 @@ fn make_node_runtime_executable(node_dir: &Path) -> Result<(), String> {
         fs::set_permissions(&path, permissions)
             .map_err(|error| format!("设置 {} 可执行权限失败：{error}", path.display()))?;
     }
+
+    Ok(())
+}
+
+fn npm_cli_path(node_dir: &Path) -> PathBuf {
+    node_dir
+        .join("lib")
+        .join("node_modules")
+        .join("npm")
+        .join("bin")
+        .join("npm-cli.js")
+}
+
+fn npx_cli_path(node_dir: &Path) -> PathBuf {
+    node_dir
+        .join("lib")
+        .join("node_modules")
+        .join("npm")
+        .join("bin")
+        .join("npx-cli.js")
+}
+
+fn repair_node_npm_launchers(node_dir: &Path) -> Result<(), String> {
+    let bin_dir = node_dir.join("bin");
+    let node = bin_dir.join("node");
+    let npm_cli = npm_cli_path(node_dir);
+    let npx_cli = npx_cli_path(node_dir);
+
+    if !node.exists() {
+        return Err(format!("内置 Node 缺少可执行文件：{}", node.display()));
+    }
+    if !npm_cli.exists() {
+        return Err(format!("内置 npm 缺少入口文件：{}", npm_cli.display()));
+    }
+
+    write_node_launcher(
+        &bin_dir.join("npm"),
+        r#"../lib/node_modules/npm/bin/npm-cli.js"#,
+    )?;
+
+    if npx_cli.exists() {
+        write_node_launcher(
+            &bin_dir.join("npx"),
+            r#"../lib/node_modules/npm/bin/npx-cli.js"#,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_node_launcher(path: &Path, cli_relative_path: &str) -> Result<(), String> {
+    if fs::symlink_metadata(path).is_ok() {
+        fs::remove_file(path)
+            .map_err(|error| format!("重建 {} 失败：{error}", path.display()))?;
+    }
+
+    let script = format!(
+        "#!/bin/sh\nDIR=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\nexec \"$DIR/node\" \"$DIR/{cli_relative_path}\" \"$@\"\n"
+    );
+
+    fs::write(path, script).map_err(|error| format!("写入 {} 失败：{error}", path.display()))?;
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("读取 {} 权限失败：{error}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("设置 {} 可执行权限失败：{error}", path.display()))?;
 
     Ok(())
 }
