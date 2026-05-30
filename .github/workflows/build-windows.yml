@@ -32,6 +32,21 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Bundle portable Node.js runtime
+        shell: pwsh
+        run: |
+          $version = "20.20.2"
+          $zip = "$env:RUNNER_TEMP\node.zip"
+          $extract = "$env:RUNNER_TEMP\node-runtime"
+          $target = "src-tauri\resources\node"
+          Invoke-WebRequest "https://nodejs.org/dist/v$version/node-v$version-win-x64.zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath $extract
+          Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "src-tauri\resources" -Force | Out-Null
+          Move-Item "$extract\node-v$version-win-x64" $target
+          & "$target\node.exe" --version
+          & "$target\npm.cmd" --version
+
       - name: Build Windows installer
         run: npm run tauri -- build
 

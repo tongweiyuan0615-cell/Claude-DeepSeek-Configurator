@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Claude Code DeepSeek Configurator",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.deepseek.claude-configurator",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -27,6 +27,7 @@
     "active": true,
     "publisher": "ytw",
     "targets": ["msi"],
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "resources": ["resources/node"]
   }
 }

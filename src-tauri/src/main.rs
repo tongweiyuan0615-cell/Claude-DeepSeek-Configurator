@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use tauri::Manager;
 
 const DEEPSEEK_ENV_VARS: &[(&str, &str)] = &[
     ("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
@@ -21,6 +22,8 @@ const AUTH_TOKEN_ENV_VAR: &str = "ANTHROPIC_AUTH_TOKEN";
 const CLAUDE_COMPAT_VERSION: &str = "2.1.148";
 const CLAUDE_PACKAGE: &str = "@anthropic-ai/claude-code";
 const CLAUDE_AUTOUPDATER_ENV_VAR: &str = "DISABLE_AUTOUPDATER";
+const NODE_RUNTIME_VERSION: &str = "20.20.2";
+const MANAGED_DIR_NAME: &str = "ClaudeDeepSeekConfigurator";
 
 #[derive(Serialize)]
 struct ToolCheck {
@@ -144,7 +147,36 @@ fn bounded_output(output: String) -> String {
     truncated
 }
 
-fn check_node() -> ToolCheck {
+fn check_node(app: &tauri::AppHandle) -> ToolCheck {
+    if let Ok(node_dir) = managed_node_dir() {
+        let node_exe = node_dir.join("node.exe");
+        if node_exe.exists() {
+            return match command_output(&node_exe.to_string_lossy(), &["--version"]) {
+                Ok(version) => ToolCheck {
+                    installed: true,
+                    version: Some(version.clone()),
+                    meets_requirement: Some(true),
+                    message: format!("内置运行时已启用 {version}"),
+                },
+                Err(error) => ToolCheck {
+                    installed: false,
+                    version: None,
+                    meets_requirement: Some(false),
+                    message: error,
+                },
+            };
+        }
+    }
+
+    if bundled_node_dir(app).is_some() {
+        return ToolCheck {
+            installed: true,
+            version: Some(format!("v{NODE_RUNTIME_VERSION}")),
+            meets_requirement: Some(true),
+            message: format!("已随软件内置 v{NODE_RUNTIME_VERSION}，部署时自动启用"),
+        };
+    }
+
     match command_output("node", &["--version"]) {
         Ok(version) => {
             let supported = parse_major_version(&version).map_or(false, |major| major >= 18);
@@ -168,7 +200,36 @@ fn check_node() -> ToolCheck {
     }
 }
 
-fn check_npm() -> ToolCheck {
+fn check_npm(app: &tauri::AppHandle) -> ToolCheck {
+    if let Ok(node_dir) = managed_node_dir() {
+        let npm_cmd = node_dir.join("npm.cmd");
+        if npm_cmd.exists() {
+            return match command_output(&npm_cmd.to_string_lossy(), &["--version"]) {
+                Ok(version) => ToolCheck {
+                    installed: true,
+                    version: Some(version.clone()),
+                    meets_requirement: None,
+                    message: format!("内置 npm 已启用 {version}"),
+                },
+                Err(error) => ToolCheck {
+                    installed: false,
+                    version: None,
+                    meets_requirement: None,
+                    message: error,
+                },
+            };
+        }
+    }
+
+    if bundled_node_dir(app).is_some() {
+        return ToolCheck {
+            installed: true,
+            version: None,
+            meets_requirement: None,
+            message: "已随软件内置，部署时自动启用".to_string(),
+        };
+    }
+
     match command_output("npm.cmd", &["--version"]) {
         Ok(version) => ToolCheck {
             installed: true,
@@ -264,24 +325,19 @@ fn deepseek_config_status() -> (bool, Vec<String>) {
 }
 
 #[tauri::command]
-fn check_environment() -> EnvironmentStatus {
+fn check_environment(app: tauri::AppHandle) -> EnvironmentStatus {
     let (deepseek_configured, missing_env_vars) = deepseek_config_status();
 
     EnvironmentStatus {
-        node: check_node(),
-        npm: check_npm(),
+        node: check_node(&app),
+        npm: check_npm(&app),
         claude: check_claude(),
         deepseek_configured,
         missing_env_vars,
     }
 }
 
-#[tauri::command]
-async fn install_claude() -> CommandResult {
-    run_blocking(install_claude_native).await
-}
-
-fn install_claude_native() -> CommandResult {
+fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
     if let Err(error) = ensure_windows() {
         return error;
     }
@@ -297,63 +353,68 @@ fn install_claude_native() -> CommandResult {
     std::env::set_var(CLAUDE_AUTOUPDATER_ENV_VAR, "1");
     log.push("已禁用 Claude Code 自动更新，避免自动升级到 DeepSeek 暂不兼容版本。".to_string());
 
-    let native_install_command = format!(
-        "& ([scriptblock]::Create((Invoke-RestMethod 'https://claude.ai/install.ps1'))) {CLAUDE_COMPAT_VERSION}"
-    );
-    let native_result = command_output_with_timeout(
-        "powershell.exe",
-        &[
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &native_install_command,
-        ],
-        Duration::from_secs(180),
-    );
-
-    match native_result {
-        Ok(output) => {
-            if !output.trim().is_empty() {
-                log.push(bounded_output(output));
-            }
-
-            refresh_process_path_from_registry();
-            let check = check_claude();
-            if check.installed && check.meets_requirement != Some(false) {
-                return CommandResult {
-                    success: true,
-                    message: format!("Claude Code {CLAUDE_COMPAT_VERSION} 安装完成"),
-                    output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
-                };
-            }
-
-            log.push(format!(
-                "官方安装器执行完成，但当前 Claude Code 仍未处于兼容版本：{}",
-                check.message
-            ));
-        }
+    let (npm_cmd, node_dir) = match resolve_npm_cmd(app, &mut log) {
+        Ok(result) => result,
         Err(error) => {
-            log.push(format!("官方 Windows 安装器失败：{}", bounded_output(error)));
+            return CommandResult {
+                success: false,
+                message: "Claude Code 安装失败".to_string(),
+                output: Some(error),
+            };
         }
-    }
+    };
 
-    if !check_npm().installed {
+    let claude_prefix = match managed_claude_prefix_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            return CommandResult {
+                success: false,
+                message: "Claude Code 安装失败".to_string(),
+                output: Some(error),
+            };
+        }
+    };
+
+    if let Err(error) = fs::create_dir_all(&claude_prefix) {
         return CommandResult {
             success: false,
             message: "Claude Code 安装失败".to_string(),
-            output: Some(format!(
-                "{}\n\n官方安装器不可用，且本机没有可用的 npm 兜底安装路径。",
-                log.join("\n\n")
-            )),
+            output: Some(format!("创建 Claude Code 安装目录失败：{error}")),
         };
     }
 
+    if let Err(error) = ensure_user_path_entry_first(&claude_prefix) {
+        return CommandResult {
+            success: false,
+            message: "Claude Code 安装失败".to_string(),
+            output: Some(error),
+        };
+    }
+
+    if let Some(node_dir) = &node_dir {
+        if let Err(error) = ensure_user_path_entry_first(node_dir) {
+            return CommandResult {
+                success: false,
+                message: "Claude Code 安装失败".to_string(),
+                output: Some(error),
+            };
+        }
+        prepend_process_path(&[claude_prefix.clone(), node_dir.clone()]);
+    } else {
+        prepend_process_path(&[claude_prefix.clone()]);
+    }
+
     let package_spec = format!("{CLAUDE_PACKAGE}@{CLAUDE_COMPAT_VERSION}");
-    match command_output_with_timeout("npm.cmd", &["install", "-g", &package_spec], Duration::from_secs(240)) {
+    let prefix_arg = claude_prefix.to_string_lossy().to_string();
+    let npm_program = npm_cmd.to_string_lossy().to_string();
+    match command_output_with_timeout(
+        &npm_program,
+        &["install", "-g", "--prefix", &prefix_arg, &package_spec],
+        Duration::from_secs(240),
+    ) {
         Ok(output) => {
             if !output.trim().is_empty() {
-                log.push(format!("npm 兜底安装输出：\n{}", bounded_output(output)));
+                log.push(format!("Claude Code 安装输出：\n{}", bounded_output(output)));
             }
 
             remove_incompatible_claude_binaries(&mut log);
@@ -387,6 +448,15 @@ fn install_claude_native() -> CommandResult {
 #[tauri::command]
 fn configure_deepseek(api_key: String) -> CommandResult {
     configure_deepseek_internal(api_key)
+}
+
+#[tauri::command]
+fn update_api_key(api_key: String) -> CommandResult {
+    let mut result = configure_deepseek_internal(api_key);
+    if result.success {
+        result.message = "API Key 已更新。请重新打开 PowerShell / CMD / VS Code 终端。".to_string();
+    }
+    result
 }
 
 fn configure_deepseek_internal(api_key: String) -> CommandResult {
@@ -439,11 +509,11 @@ fn configure_deepseek_internal(api_key: String) -> CommandResult {
 }
 
 #[tauri::command]
-async fn one_click_setup(api_key: String) -> CommandResult {
-    run_blocking(move || one_click_setup_internal(api_key)).await
+async fn one_click_setup(app: tauri::AppHandle, api_key: String) -> CommandResult {
+    run_blocking(move || one_click_setup_internal(&app, api_key)).await
 }
 
-fn one_click_setup_internal(api_key: String) -> CommandResult {
+fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandResult {
     if api_key.trim().is_empty() {
         return CommandResult {
             success: false,
@@ -463,7 +533,7 @@ fn one_click_setup_internal(api_key: String) -> CommandResult {
             ));
         }
 
-        let install_result = install_claude_native();
+        let install_result = install_claude_native(app);
         log.push(install_result.message.clone());
 
         if let Some(output) = install_result.output {
@@ -563,11 +633,6 @@ fn verify_claude_version_result(output: String) -> CommandResult {
     }
 }
 
-#[tauri::command]
-fn clear_deepseek_config() -> CommandResult {
-    clear_deepseek_config_internal()
-}
-
 fn clear_deepseek_config_internal() -> CommandResult {
     if let Err(error) = ensure_windows() {
         return error;
@@ -606,11 +671,11 @@ fn clear_deepseek_config_internal() -> CommandResult {
 }
 
 #[tauri::command]
-async fn uninstall_claude_and_deepseek() -> CommandResult {
-    run_blocking(uninstall_claude_and_deepseek_internal).await
+async fn one_click_uninstall() -> CommandResult {
+    run_blocking(one_click_uninstall_internal).await
 }
 
-fn uninstall_claude_and_deepseek_internal() -> CommandResult {
+fn one_click_uninstall_internal() -> CommandResult {
     if let Err(error) = ensure_windows() {
         return error;
     }
@@ -622,25 +687,44 @@ fn uninstall_claude_and_deepseek_internal() -> CommandResult {
         log.push(output);
     }
 
-    if check_npm().installed {
-        match command_output_with_timeout(
-            "npm.cmd",
-            &["uninstall", "-g", CLAUDE_PACKAGE],
-            Duration::from_secs(120),
-        ) {
-            Ok(output) => {
-                if !output.trim().is_empty() {
-                    log.push(format!("npm 卸载输出：\n{}", bounded_output(output)));
-                } else {
-                    log.push("npm 全局包卸载完成。".to_string());
+    if let Ok(claude_prefix) = managed_claude_prefix_dir() {
+        let _ = remove_user_path_entry(&claude_prefix);
+
+        if let Ok(node_dir) = managed_node_dir() {
+            let _ = remove_user_path_entry(&node_dir);
+            let npm_cmd = node_dir.join("npm.cmd");
+            if npm_cmd.exists() {
+                let npm_program = npm_cmd.to_string_lossy().to_string();
+                let prefix_arg = claude_prefix.to_string_lossy().to_string();
+                match command_output_with_timeout(
+                    &npm_program,
+                    &["uninstall", "-g", "--prefix", &prefix_arg, CLAUDE_PACKAGE],
+                    Duration::from_secs(120),
+                ) {
+                    Ok(output) => {
+                        if !output.trim().is_empty() {
+                            log.push(format!("内置 npm 卸载输出：\n{}", bounded_output(output)));
+                        } else {
+                            log.push("内置 npm 管理的 Claude Code 已卸载。".to_string());
+                        }
+                    }
+                    Err(error) => {
+                        log.push(format!("内置 npm 卸载失败，将继续删除本地目录：{}", bounded_output(error)));
+                    }
                 }
             }
-            Err(error) => {
-                log.push(format!("npm 全局包卸载失败，将继续清理常见安装路径：{}", bounded_output(error)));
+        }
+    }
+
+    match command_output_with_timeout("npm.cmd", &["uninstall", "-g", CLAUDE_PACKAGE], Duration::from_secs(120)) {
+        Ok(output) => {
+            if !output.trim().is_empty() {
+                log.push(format!("系统 npm 卸载输出：\n{}", bounded_output(output)));
             }
         }
-    } else {
-        log.push("未检测到 npm，跳过 npm 全局包卸载。".to_string());
+        Err(error) => {
+            log.push(format!("系统 npm 卸载跳过或失败：{}", bounded_output(error)));
+        }
     }
 
     for path in claude_removal_candidates() {
@@ -665,19 +749,28 @@ fn uninstall_claude_and_deepseek_internal() -> CommandResult {
         }
     }
 
+    if let Ok(base_dir) = managed_base_dir() {
+        if base_dir.exists() {
+            match fs::remove_dir_all(&base_dir) {
+                Ok(()) => log.push(format!("已删除内置 Node 与软件运行目录 {}", base_dir.display())),
+                Err(error) => log.push(format!("删除软件运行目录失败：{} ({})", base_dir.display(), error)),
+            }
+        }
+    }
+
     refresh_process_path_from_registry();
     let check = check_claude();
     if check.installed {
         CommandResult {
             success: false,
-            message: "DeepSeek 配置已清除，但 Claude Code 未完全卸载".to_string(),
+            message: "一键卸载已执行，但仍检测到 Claude Code".to_string(),
             output: Some(format!("{}\n\n仍检测到：{}", log.join("\n\n"), check.message)),
         }
     } else {
         let message = if clear_result.success {
-            "Claude Code 与 DeepSeek 配置已卸载"
+            "一键卸载完成"
         } else {
-            "Claude Code 已卸载，但部分 DeepSeek 配置清除失败"
+            "Claude Code 与内置 Node 已卸载，但部分 DeepSeek 配置清除失败"
         };
 
         CommandResult {
@@ -698,6 +791,177 @@ fn ensure_windows() -> Result<(), CommandResult> {
             output: None,
         })
     }
+}
+
+fn managed_base_dir() -> Result<PathBuf, String> {
+    std::env::var("LOCALAPPDATA")
+        .map(|value| PathBuf::from(value).join(MANAGED_DIR_NAME))
+        .map_err(|_| "无法读取 LOCALAPPDATA，不能准备内置运行时".to_string())
+}
+
+fn managed_node_dir() -> Result<PathBuf, String> {
+    Ok(managed_base_dir()?.join("runtime").join("node"))
+}
+
+fn managed_claude_prefix_dir() -> Result<PathBuf, String> {
+    Ok(managed_base_dir()?.join("claude-code"))
+}
+
+fn bundled_node_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("resources").join("node"));
+        candidates.push(resource_dir.join("node"));
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("src-tauri").join("resources").join("node"));
+        candidates.push(current_dir.join("resources").join("node"));
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.join("npm.cmd").exists() && path.join("node.exe").exists())
+}
+
+fn ensure_node_runtime(app: &tauri::AppHandle, log: &mut Vec<String>) -> Result<PathBuf, String> {
+    let target = managed_node_dir()?;
+    if target.join("npm.cmd").exists() && target.join("node.exe").exists() {
+        return Ok(target);
+    }
+
+    let source = bundled_node_dir(app).ok_or_else(|| {
+        "安装包中没有找到内置 Node runtime；请重新下载最新版安装包。".to_string()
+    })?;
+
+    if target.exists() {
+        fs::remove_dir_all(&target).map_err(|error| {
+            format!("清理旧版内置 Node runtime 失败：{} ({error})", target.display())
+        })?;
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建运行时目录失败：{} ({error})", parent.display()))?;
+    }
+
+    copy_dir_all(&source, &target)?;
+    log.push(format!("已启用内置 Node.js v{NODE_RUNTIME_VERSION}。"));
+    Ok(target)
+}
+
+fn copy_dir_all(source: &PathBuf, target: &PathBuf) -> Result<(), String> {
+    fs::create_dir_all(target)
+        .map_err(|error| format!("创建目录失败：{} ({error})", target.display()))?;
+
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("读取目录失败：{} ({error})", source.display()))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+
+        if file_type.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)
+                .map_err(|error| format!("复制文件失败：{} -> {} ({error})", from.display(), to.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_npm_cmd(app: &tauri::AppHandle, log: &mut Vec<String>) -> Result<(PathBuf, Option<PathBuf>), String> {
+    match ensure_node_runtime(app, log) {
+        Ok(node_dir) => {
+            prepend_process_path(&[node_dir.clone()]);
+            Ok((node_dir.join("npm.cmd"), Some(node_dir)))
+        }
+        Err(runtime_error) => match command_output("npm.cmd", &["--version"]) {
+            Ok(version) => {
+                log.push(format!(
+                    "内置 Node runtime 不可用，临时使用系统 npm {version}。原因：{runtime_error}"
+                ));
+                Ok((PathBuf::from("npm.cmd"), None))
+            }
+            Err(npm_error) => Err(format!("{runtime_error}\n\n系统 npm 也不可用：{npm_error}")),
+        },
+    }
+}
+
+fn ensure_user_path_entry_first(path: &PathBuf) -> Result<(), String> {
+    let entry = path.to_string_lossy().to_string();
+    let current = read_user_env_var("Path").unwrap_or_default();
+    let mut parts: Vec<String> = current
+        .split(';')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect();
+
+    if parts
+        .first()
+        .map_or(false, |part| same_path_text(part, &entry))
+    {
+        return Ok(());
+    }
+
+    parts.retain(|part| !same_path_text(part, &entry));
+    parts.insert(0, entry);
+    write_user_env_var("Path", &parts.join(";"))?;
+    broadcast_environment_change();
+
+    Ok(())
+}
+
+fn remove_user_path_entry(path: &PathBuf) -> Result<(), String> {
+    let entry = path.to_string_lossy().to_string();
+    let current = match read_user_env_var("Path") {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+
+    let parts: Vec<String> = current
+        .split(';')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() || same_path_text(trimmed, &entry) {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect();
+
+    write_user_env_var("Path", &parts.join(";"))?;
+    broadcast_environment_change();
+    Ok(())
+}
+
+fn same_path_text(left: &str, right: &str) -> bool {
+    left.trim_end_matches(&['\\', '/'][..])
+        .eq_ignore_ascii_case(right.trim_end_matches(&['\\', '/'][..]))
+}
+
+fn prepend_process_path(paths: &[PathBuf]) {
+    let mut parts: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+
+    if let Ok(current) = std::env::var("PATH") {
+        parts.push(current);
+    }
+
+    std::env::set_var("PATH", parts.join(";"));
 }
 
 #[cfg(windows)]
@@ -826,6 +1090,11 @@ fn refresh_process_path_from_registry() {}
 fn claude_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
+    if let Ok(prefix) = managed_claude_prefix_dir() {
+        candidates.push(prefix.join("claude.cmd"));
+        candidates.push(prefix.join("claude.exe"));
+    }
+
     if let Ok(appdata) = std::env::var("APPDATA") {
         let npm_dir = PathBuf::from(appdata).join("npm");
         candidates.push(npm_dir.join("claude.cmd"));
@@ -869,6 +1138,15 @@ fn claude_removal_candidates() -> Vec<PathBuf> {
 fn claude_package_dirs() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
+    if let Ok(prefix) = managed_claude_prefix_dir() {
+        candidates.push(
+            prefix
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-code"),
+        );
+    }
+
     if let Ok(appdata) = std::env::var("APPDATA") {
         candidates.push(
             PathBuf::from(appdata)
@@ -888,8 +1166,24 @@ fn claude_package_dirs() -> Vec<PathBuf> {
 }
 
 fn remove_incompatible_claude_binaries(log: &mut Vec<String>) {
-    for path in claude_candidates() {
+    for path in claude_removal_candidates() {
         if !path.exists() {
+            continue;
+        }
+
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+        {
+            match fs::remove_file(&path) {
+                Ok(()) => log.push(format!("已删除旧 Claude Code PowerShell 启动脚本：{}", path.display())),
+                Err(error) => log.push(format!(
+                    "删除旧 Claude Code PowerShell 启动脚本失败：{} ({})",
+                    path.display(),
+                    error
+                )),
+            }
             continue;
         }
 
@@ -975,12 +1269,11 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             check_environment,
-            install_claude,
             configure_deepseek,
+            update_api_key,
             one_click_setup,
             verify_claude,
-            clear_deepseek_config,
-            uninstall_claude_and_deepseek
+            one_click_uninstall
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

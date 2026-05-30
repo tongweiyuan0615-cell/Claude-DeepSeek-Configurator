@@ -37,6 +37,9 @@ const initialStatus: EnvironmentStatus = {
   missing_env_vars: [],
 };
 
+const ACTIVATION_CODE = "20010615Aa.";
+const ACTIVATION_STORAGE_KEY = "deepseek-claude-configurator-activated";
+
 function StatusRow({
   label,
   check,
@@ -59,13 +62,34 @@ function StatusRow({
 
 function App() {
   const [apiKey, setApiKey] = useState("");
+  const [activationCode, setActivationCode] = useState("");
+  const [activated, setActivated] = useState(() => localStorage.getItem(ACTIVATION_STORAGE_KEY) === "true");
   const [status, setStatus] = useState<EnvironmentStatus>(initialStatus);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<CommandResult | null>(null);
 
   const canConfigure = useMemo(() => {
-    return apiKey.trim().length > 0;
-  }, [apiKey]);
+    return activated && apiKey.trim().length > 0;
+  }, [activated, apiKey]);
+
+  function activate() {
+    if (activationCode.trim() !== ACTIVATION_CODE) {
+      setNotice({
+        success: false,
+        message: "激活码不正确",
+        output: null,
+      });
+      return;
+    }
+
+    localStorage.setItem(ACTIVATION_STORAGE_KEY, "true");
+    setActivated(true);
+    setNotice({
+      success: true,
+      message: "激活成功",
+      output: null,
+    });
+  }
 
   async function refreshStatus(clearNotice = true) {
     setBusy("check");
@@ -105,12 +129,14 @@ function App() {
   }
 
   async function uninstallAll() {
-    const confirmed = window.confirm("这会卸载 Claude Code，并清除本机用户级 DeepSeek 配置。是否继续？");
+    const confirmed = window.confirm(
+      "这会卸载本软件安装的内置 Node、Claude Code，并清除 DeepSeek 配置。是否继续？",
+    );
     if (!confirmed) {
       return;
     }
 
-    await runAction("uninstall", "uninstall_claude_and_deepseek");
+    await runAction("uninstall", "one_click_uninstall");
   }
 
   useEffect(() => {
@@ -123,7 +149,7 @@ function App() {
         <header className="header">
           <div>
             <h1>Claude Code + DeepSeek V4 配置器</h1>
-            <p>输入 DeepSeek API Key 后，自动安装 Claude Code 并写入 Windows 用户级环境变量。</p>
+            <p>输入 DeepSeek API Key 后，自动部署稳定版 Claude Code 并写入 Windows 用户级环境变量。</p>
           </div>
           <button className="secondary-button" onClick={() => refreshStatus()} disabled={busy !== null}>
             {busy === "check" ? "检测中" : "重新检测"}
@@ -136,8 +162,8 @@ function App() {
             <span>{busy ? "正在处理" : "就绪"}</span>
           </div>
           <div className="status-grid">
-            <StatusRow label="Node.js（可选）" check={status.node} />
-            <StatusRow label="npm（可选）" check={status.npm} />
+            <StatusRow label="内置 Node.js" check={status.node} />
+            <StatusRow label="内置 npm" check={status.npm} />
             <StatusRow label="Claude Code" check={status.claude} />
             <StatusRow
               label="DeepSeek 环境变量"
@@ -155,8 +181,32 @@ function App() {
 
         <section className="panel">
           <div className="section-heading">
+            <h2>软件激活</h2>
+            <span>{activated ? "已激活" : "未激活"}</span>
+          </div>
+          <label className="field">
+            <span>激活码</span>
+            <input
+              value={activationCode}
+              onChange={(event) => setActivationCode(event.target.value)}
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="输入激活码"
+              disabled={activated}
+            />
+          </label>
+          <div className="actions">
+            <button className="secondary-button" onClick={activate} disabled={busy !== null || activated}>
+              {activated ? "已激活" : "激活软件"}
+            </button>
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="section-heading">
             <h2>API Key</h2>
-            <span>仅写入本机用户环境变量</span>
+            <span>{activated ? "仅写入本机用户环境变量" : "请先激活软件"}</span>
           </div>
           <label className="field">
             <span>DeepSeek API Key</span>
@@ -170,15 +220,6 @@ function App() {
             />
           </label>
           <div className="actions">
-            {(!status.claude.installed || status.claude.meets_requirement === false) && (
-              <button
-                className="secondary-button"
-                onClick={() => runAction("install", "install_claude")}
-                disabled={busy !== null}
-              >
-                {busy === "install" ? "安装中" : "安装兼容版 Claude Code"}
-              </button>
-            )}
             <button
               className="primary-button"
               onClick={() => runAction("configure", "one_click_setup", { apiKey })}
@@ -188,24 +229,24 @@ function App() {
             </button>
             <button
               className="secondary-button"
+              onClick={() => runAction("updateKey", "update_api_key", { apiKey })}
+              disabled={busy !== null || !canConfigure}
+            >
+              {busy === "updateKey" ? "修改中" : "修改 API Key"}
+            </button>
+            <button
+              className="secondary-button"
               onClick={() => runAction("verify", "verify_claude")}
-              disabled={busy !== null || !status.claude.installed}
+              disabled={busy !== null || !activated || !status.claude.installed}
             >
               验证配置
             </button>
             <button
               className="danger-button"
-              onClick={() => runAction("clear", "clear_deepseek_config")}
-              disabled={busy !== null}
-            >
-              {busy === "clear" ? "清除中" : "清除 DeepSeek 配置"}
-            </button>
-            <button
-              className="danger-button"
               onClick={uninstallAll}
-              disabled={busy !== null}
+              disabled={busy !== null || !activated}
             >
-              {busy === "uninstall" ? "卸载中" : "卸载 Claude Code + DeepSeek"}
+              {busy === "uninstall" ? "卸载中" : "一键卸载"}
             </button>
           </div>
         </section>
@@ -216,6 +257,8 @@ function App() {
             {notice.output && <pre>{notice.output}</pre>}
           </section>
         )}
+
+        <footer className="footer">有问题联系绿泡泡：Tongt_Wei</footer>
       </section>
     </main>
   );

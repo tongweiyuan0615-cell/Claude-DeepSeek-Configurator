@@ -249,6 +249,13 @@ button:disabled {
   line-height: 1.5;
 }
 
+.footer {
+  margin: 18px 0 0;
+  color: #5e6a7d;
+  font-size: 13px;
+  text-align: center;
+}
+
 @media (max-width: 720px) {
   .app-shell {
     padding: 22px;
