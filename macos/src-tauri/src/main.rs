@@ -655,61 +655,54 @@ fn one_click_uninstall_internal() -> CommandResult {
     }
 
     let mut log = Vec::new();
+    let mut errors = Vec::new();
     let clear_result = clear_deepseek_config_internal();
     log.push(clear_result.message.clone());
     if let Some(output) = clear_result.output {
         log.push(output);
     }
 
-    if let (Ok(node_dir), Ok(claude_prefix)) = (managed_node_dir(), managed_claude_prefix_dir()) {
-        let npm = node_dir.join("bin").join("npm");
-        if npm.exists() {
-            let _ = repair_node_npm_launchers(&node_dir);
-            prepend_process_path(&[node_dir.join("bin")]);
-            let npm_program = npm.to_string_lossy().to_string();
-            let prefix_arg = claude_prefix.to_string_lossy().to_string();
-            match command_output_with_timeout(
-                &npm_program,
-                &["uninstall", "-g", "--prefix", &prefix_arg, CLAUDE_PACKAGE],
-                Duration::from_secs(120),
-            ) {
-                Ok(output) => {
-                    if !output.trim().is_empty() {
-                        log.push(format!("内置 npm 卸载输出：\n{}", bounded_output(output)));
-                    } else {
-                        log.push("内置 npm 管理的 Claude Code 已卸载。".to_string());
-                    }
-                }
-                Err(error) => {
-                    log.push(format!("内置 npm 卸载失败，将继续删除本地目录：{}", bounded_output(error)));
-                }
-            }
-        }
-    }
-
     if let Ok(base_dir) = managed_base_dir() {
         if base_dir.exists() {
             match fs::remove_dir_all(&base_dir) {
-                Ok(()) => log.push(format!("已删除内置 Node 与软件运行目录 {}", base_dir.display())),
-                Err(error) => log.push(format!("删除软件运行目录失败：{} ({})", base_dir.display(), error)),
+                Ok(()) => log.push(format!("已删除本软件安装的内置 Node 与 Claude Code：{}", base_dir.display())),
+                Err(error) => {
+                    let message = format!("删除软件运行目录失败：{} ({})", base_dir.display(), error);
+                    errors.push(message.clone());
+                    log.push(message);
+                }
             }
+        } else {
+            log.push("本软件安装目录不存在，无需重复删除。".to_string());
         }
     }
 
-    let external = check_claude();
-    if external.installed {
-        log.push(format!(
-            "提示：仍检测到 Claude Code：{}。如果这是你自己安装的版本，本软件不会删除它。",
-            external.message
-        ));
+    remove_process_path_entries(&managed_tool_path_entries());
+
+    match first_claude_from_login_shell() {
+        Some(path) if is_managed_claude_path(&path) => {
+            let message = format!("新终端仍会命中本软件 Claude 路径：{}。请检查 shell 配置是否还有旧 PATH。", path.display());
+            errors.push(message.clone());
+            log.push(message);
+        }
+        Some(path) => {
+            log.push(format!(
+                "提示：新终端仍检测到其他 Claude Code：{}。这通常是用户自己安装的外部版本，本软件不会删除它。",
+                path.display()
+            ));
+        }
+        None => log.push("新终端已不再检测到本软件安装的 Claude Code。".to_string()),
     }
 
+    log.push("如果已经打开的 Terminal / iTerm / VS Code 终端里 claude 仍能运行，请完全关闭后重新打开；旧终端会保留卸载前的 PATH 或命令缓存。".to_string());
+
+    let success = clear_result.success && errors.is_empty();
     CommandResult {
-        success: clear_result.success,
-        message: if clear_result.success {
+        success,
+        message: if success {
             "一键卸载完成"
         } else {
-            "内置 Node 与 Claude Code 已卸载，但部分 DeepSeek 配置清除失败"
+            "一键卸载未完全完成"
         }
         .to_string(),
         output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
@@ -959,6 +952,35 @@ fn prepend_process_path(paths: &[PathBuf]) {
     if let Ok(current) = std::env::var("PATH") {
         parts.push(current);
     }
+
+    std::env::set_var("PATH", parts.join(":"));
+}
+
+fn remove_process_path_entries(paths: &[PathBuf]) {
+    let Ok(current) = std::env::var("PATH") else {
+        return;
+    };
+
+    let targets: Vec<String> = paths
+        .iter()
+        .map(|path| normalize_unix_path_text(&path.to_string_lossy()))
+        .collect();
+
+    let parts: Vec<String> = current
+        .split(':')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty()
+                || targets
+                    .iter()
+                    .any(|target| normalize_unix_path_text(trimmed) == *target)
+            {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect();
 
     std::env::set_var("PATH", parts.join(":"));
 }

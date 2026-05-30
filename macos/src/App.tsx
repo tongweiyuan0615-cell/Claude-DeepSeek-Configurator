@@ -69,6 +69,7 @@ function App() {
   const [status, setStatus] = useState<EnvironmentStatus>(initialStatus);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<CommandResult | null>(null);
+  const [confirmingUninstall, setConfirmingUninstall] = useState(false);
 
   const canConfigure = useMemo(() => {
     return activated && apiKey.trim().length > 0;
@@ -114,6 +115,7 @@ function App() {
 
   async function runAction(action: string, command: string, payload?: Record<string, unknown>) {
     setBusy(action);
+    setConfirmingUninstall(false);
     setNotice(null);
     try {
       const result = await invoke<CommandResult>(command, payload);
@@ -131,10 +133,13 @@ function App() {
   }
 
   async function uninstallAll() {
-    const confirmed = window.confirm(
-      "这会卸载本软件安装的内置 Node、Claude Code，并清除 macOS DeepSeek 配置。是否继续？",
-    );
-    if (!confirmed) {
+    if (!confirmingUninstall) {
+      setConfirmingUninstall(true);
+      setNotice({
+        success: false,
+        message: "请再次点击“确认卸载”",
+        output: "将删除本软件安装的内置 Node、Claude Code，并清除 macOS DeepSeek 配置。",
+      });
       return;
     }
 
@@ -249,7 +254,7 @@ function App() {
               onClick={uninstallAll}
               disabled={busy !== null || !activated}
             >
-              {busy === "uninstall" ? "卸载中" : "一键卸载"}
+              {busy === "uninstall" ? "卸载中" : confirmingUninstall ? "确认卸载" : "一键卸载"}
             </button>
           </div>
         </section>
