@@ -19,3 +19,9 @@ macos/src-tauri/resources/node/*
 *.log
 *.zip
 *.dmg
+*.msi
+*.pkg
+*.app
+*.tar.gz
+.DS_Store
+Thumbs.db
