@@ -64,6 +64,4 @@ jobs:
         with:
           name: macos-installers
           if-no-files-found: error
-          path: |
-            macos/src-tauri/target/release/bundle/dmg/*.dmg
-            macos/src-tauri/target/release/bundle/macos/*.app
+          path: macos/src-tauri/target/release/bundle/dmg/*.dmg
