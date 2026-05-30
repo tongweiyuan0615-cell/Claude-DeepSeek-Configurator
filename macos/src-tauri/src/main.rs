@@ -251,6 +251,9 @@ fn check_npm(app: &tauri::AppHandle) -> ToolCheck {
 }
 
 fn check_claude() -> ToolCheck {
+    let path_entries = managed_tool_path_entries();
+    prepend_process_path(&path_entries);
+
     match command_output_from_candidates(&claude_candidates(), &["--version"]) {
         Ok(version) => claude_tool_check(version),
         Err(candidate_error) => match command_output("/bin/zsh", &["-lc", "claude --version"]) {
@@ -550,7 +553,8 @@ fn one_click_setup_internal(app: &tauri::AppHandle, api_key: String) -> CommandR
 
 #[tauri::command]
 fn verify_claude() -> CommandResult {
-    prepend_process_path(&[managed_claude_bin_dir()]);
+    let path_entries = managed_tool_path_entries();
+    prepend_process_path(&path_entries);
 
     match command_output_from_candidates(&claude_candidates(), &["--version"]) {
         Ok(output) => verify_claude_version_result(output),
@@ -731,6 +735,14 @@ fn managed_claude_bin_dir() -> PathBuf {
         .join("bin")
 }
 
+fn managed_tool_path_entries() -> Vec<PathBuf> {
+    let mut entries = vec![managed_claude_bin_dir()];
+    if let Ok(node_dir) = managed_node_dir() {
+        entries.push(node_dir.join("bin"));
+    }
+    entries
+}
+
 fn env_file_path() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(ENV_FILE_NAME))
 }
@@ -885,7 +897,7 @@ fn write_node_launcher(path: &Path, cli_relative_path: &str) -> Result<(), Strin
     }
 
     let script = format!(
-        "#!/bin/sh\nDIR=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\nexec \"$DIR/node\" \"$DIR/{cli_relative_path}\" \"$@\"\n"
+        "#!/bin/sh\nDIR=\"$(CDPATH= cd \"$(dirname \"$0\")\" && pwd)\"\nexec \"$DIR/node\" \"$DIR/{cli_relative_path}\" \"$@\"\n"
     );
 
     fs::write(path, script).map_err(|error| format!("写入 {} 失败：{error}", path.display()))?;
