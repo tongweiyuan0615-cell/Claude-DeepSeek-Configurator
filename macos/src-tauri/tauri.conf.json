@@ -1,0 +1,33 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Claude Code DeepSeek Configurator macOS",
+  "version": "0.2.0",
+  "identifier": "com.ytw.claudedeepseekconfigurator.macos",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Claude Code + DeepSeek V4 配置器 macOS",
+        "width": 980,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 560
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "publisher": "ytw",
+    "targets": ["dmg"],
+    "icon": ["icons/icon.icns"],
+    "resources": ["resources/node"]
+  }
+}

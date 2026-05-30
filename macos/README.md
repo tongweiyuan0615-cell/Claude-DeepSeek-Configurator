@@ -1,13 +1,7 @@
 # macOS Version
 
-This folder is reserved for the macOS port.
+This folder contains the isolated macOS Tauri app.
 
-The macOS implementation should stay isolated from the Windows app. Planned behavior:
+It bundles a portable macOS Node.js runtime, installs the pinned Claude Code version, and writes DeepSeek configuration to `~/.claude-deepseek-env`.
 
-- Bundle a macOS Node.js runtime.
-- Install `@anthropic-ai/claude-code@2.1.148`.
-- Write DeepSeek settings through a macOS shell environment file.
-- Add a source line to the user's shell profile.
-- Support one-click deploy, API key update, verification, and uninstall.
-
-The first macOS build will be an unsigned test build. Apple Developer ID signing and notarization can be added later.
+The first macOS build is an unsigned test build. Apple Developer ID signing and notarization can be added later.

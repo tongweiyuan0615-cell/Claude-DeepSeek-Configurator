@@ -17,3 +17,5 @@ macos/src-tauri/gen
 macos/src-tauri/resources/node/*
 !macos/src-tauri/resources/node/.gitkeep
 *.log
+*.zip
+*.dmg

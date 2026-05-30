@@ -1,0 +1,69 @@
+name: Build macOS installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "macos-v*"
+
+jobs:
+  build:
+    name: Build macOS Tauri app
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: macos/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: macos/src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Bundle portable Node.js runtime
+        run: |
+          set -euo pipefail
+          version="20.20.2"
+          case "$(uname -m)" in
+            arm64) node_arch="arm64" ;;
+            x86_64) node_arch="x64" ;;
+            *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/node.tar.gz"
+          extract="$RUNNER_TEMP/node-runtime"
+          target="src-tauri/resources/node"
+          curl -L "https://nodejs.org/dist/v$version/node-v$version-darwin-$node_arch.tar.gz" -o "$archive"
+          rm -rf "$extract" "$target"
+          mkdir -p "$extract" "src-tauri/resources"
+          tar -xzf "$archive" -C "$extract"
+          mv "$extract/node-v$version-darwin-$node_arch" "$target"
+          "$target/bin/node" --version
+          "$target/bin/npm" --version
+
+      - name: Build macOS installer
+        run: npm run tauri -- build
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installers
+          if-no-files-found: error
+          path: |
+            macos/src-tauri/target/release/bundle/dmg/*.dmg
+            macos/src-tauri/target/release/bundle/macos/*.app

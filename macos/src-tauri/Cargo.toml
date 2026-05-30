@@ -1,0 +1,13 @@
+[package]
+name = "deepseek_claude_configurator_macos"
+version = "0.2.0"
+description = "Claude Code + DeepSeek V4 macOS configurator"
+authors = ["ytw"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
