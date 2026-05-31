@@ -350,6 +350,163 @@ fn check_environment(app: tauri::AppHandle) -> EnvironmentStatus {
     }
 }
 
+#[tauri::command]
+fn generate_diagnostic_report(app: tauri::AppHandle) -> CommandResult {
+    let status = check_environment(app);
+    let vars = read_macos_env_file();
+    let mut lines = Vec::new();
+
+    lines.push("Claude Code + DeepSeek Configurator diagnostic report".to_string());
+    lines.push("Platform: macOS".to_string());
+    lines.push(format!("App version: {}", env!("CARGO_PKG_VERSION")));
+    lines.push(format!("Claude compatible version: {CLAUDE_COMPAT_VERSION}"));
+    lines.push(format!("Bundled Node.js version: v{NODE_RUNTIME_VERSION}"));
+    lines.push(String::new());
+
+    lines.push("Managed paths:".to_string());
+    add_path_report(&mut lines, "Managed base", managed_base_dir());
+    add_path_report(&mut lines, "Managed Node", managed_node_dir());
+    add_path_report(&mut lines, "Managed Claude prefix", managed_claude_prefix_dir());
+    add_path_report(&mut lines, "Managed env file", env_file_path());
+    lines.push(String::new());
+
+    lines.push("Shell profile links:".to_string());
+    match shell_profile_paths() {
+        Ok(profiles) => {
+            for profile in profiles {
+                let contains_block = fs::read_to_string(&profile)
+                    .map(|content| content.contains(PROFILE_START) && content.contains(PROFILE_END))
+                    .unwrap_or(false);
+                lines.push(format!(
+                    "{}: exists={}, managed_block={}",
+                    profile.display(),
+                    profile.exists(),
+                    contains_block
+                ));
+            }
+        }
+        Err(error) => lines.push(format!("unavailable ({error})")),
+    }
+    lines.push(String::new());
+
+    lines.push("Tool checks:".to_string());
+    lines.push(format_tool_check("Node.js", &status.node));
+    lines.push(format_tool_check("npm", &status.npm));
+    lines.push(format_tool_check("Claude Code", &status.claude));
+    lines.push(format_tool_check("Claude PATH priority", &status.claude_path));
+    lines.push(String::new());
+
+    lines.push("DeepSeek environment:".to_string());
+    lines.push(format!(
+        "{AUTH_TOKEN_ENV_VAR}: {}",
+        if vars
+            .get(AUTH_TOKEN_ENV_VAR)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            "configured (redacted)"
+        } else {
+            "missing"
+        }
+    ));
+    lines.push(format_macos_env_state(&vars, CLAUDE_AUTOUPDATER_ENV_VAR, "1"));
+    for (name, expected) in DEEPSEEK_ENV_VARS {
+        lines.push(format_macos_env_state(&vars, name, expected));
+    }
+    lines.push(format!(
+        "Overall DeepSeek status: {}",
+        if status.deepseek_configured {
+            "configured"
+        } else {
+            "incomplete"
+        }
+    ));
+    lines.push(format!(
+        "Missing variables: {}",
+        if status.missing_env_vars.is_empty() {
+            "none".to_string()
+        } else {
+            status.missing_env_vars.join(", ")
+        }
+    ));
+    lines.push(String::new());
+    lines.push("Secret policy: API Key values are never included in this report.".to_string());
+
+    CommandResult {
+        success: true,
+        message: "诊断报告已生成，API Key 已自动脱敏。".to_string(),
+        output: Some(redact_sensitive_text(&lines.join("\n"))),
+    }
+}
+
+fn add_path_report(lines: &mut Vec<String>, label: &str, path: Result<PathBuf, String>) {
+    match path {
+        Ok(path) => lines.push(format!("{label}: {} (exists: {})", path.display(), path.exists())),
+        Err(error) => lines.push(format!("{label}: unavailable ({error})")),
+    }
+}
+
+fn format_tool_check(label: &str, check: &ToolCheck) -> String {
+    format!(
+        "{label}: installed={}, version={}, meets_requirement={}, message={}",
+        check.installed,
+        check.version.as_deref().unwrap_or("unknown"),
+        match check.meets_requirement {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        },
+        redact_sensitive_text(&check.message)
+    )
+}
+
+fn format_macos_env_state(vars: &HashMap<String, String>, name: &str, expected: &str) -> String {
+    let state = match vars.get(name) {
+        Some(value) if value == expected => "ok",
+        Some(_) => "configured but unexpected",
+        None => "missing",
+    };
+    format!("{name}: {state}")
+}
+
+fn redact_sensitive_text(input: &str) -> String {
+    let mut output = input.to_string();
+    let vars = read_macos_env_file();
+    if let Some(token) = vars.get(AUTH_TOKEN_ENV_VAR) {
+        let token = token.trim();
+        if !token.is_empty() {
+            output = output.replace(token, "[REDACTED]");
+        }
+    }
+
+    redact_sk_tokens(&output)
+}
+
+fn redact_sk_tokens(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut output = String::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if index + 3 <= chars.len() && chars[index] == 's' && chars[index + 1] == 'k' && chars[index + 2] == '-' {
+            output.push_str("[REDACTED]");
+            index += 3;
+            while index < chars.len()
+                && (chars[index].is_ascii_alphanumeric()
+                    || matches!(chars[index], '-' | '_' | '.'))
+            {
+                index += 1;
+            }
+            continue;
+        }
+
+        output.push(chars[index]);
+        index += 1;
+    }
+
+    output
+}
+
 fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
     if let Err(error) = ensure_macos() {
         return error;
@@ -1291,6 +1448,7 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             check_environment,
+            generate_diagnostic_report,
             configure_deepseek,
             update_api_key,
             one_click_setup,

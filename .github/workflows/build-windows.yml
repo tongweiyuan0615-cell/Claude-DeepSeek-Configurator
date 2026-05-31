@@ -28,6 +28,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check manifest versions
+        working-directory: .
+        run: node scripts/check-version-consistency.mjs
+
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:

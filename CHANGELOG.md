@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Added redacted diagnostic reports for Windows and macOS support.
+- Added CI version consistency checks across Windows and macOS manifests.
+- Aligned Windows package metadata with release version 0.2.0.
 - Hardened Windows and macOS Claude PATH priority handling.
 - Added deterministic macOS one-click uninstall behavior.
 - Reduced macOS GitHub Actions artifact size by uploading only DMG files.

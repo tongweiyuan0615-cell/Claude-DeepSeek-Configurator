@@ -1,5 +1,13 @@
 # Troubleshooting
 
+## Generate a diagnostic report
+
+Use the `Diagnostic report` button in the app when a user reports that deployment, verification, or uninstall did not work as expected.
+
+The report is designed for support and must not contain the DeepSeek API Key. It reports only whether the key is configured, plus tool versions, managed paths, PATH priority, and missing environment variable names.
+
+Before sharing a report publicly, still review it for local usernames or private filesystem paths.
+
 ## macOS says the app is damaged or cannot be opened
 
 The current macOS build is unsigned. After copying the app to `/Applications`, run:

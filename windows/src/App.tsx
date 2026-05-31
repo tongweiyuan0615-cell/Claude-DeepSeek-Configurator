@@ -245,6 +245,13 @@ function App() {
               验证配置
             </button>
             <button
+              className="secondary-button"
+              onClick={() => runAction("diagnostic", "generate_diagnostic_report")}
+              disabled={busy !== null}
+            >
+              {busy === "diagnostic" ? "生成中" : "诊断报告"}
+            </button>
+            <button
               className="danger-button"
               onClick={uninstallAll}
               disabled={busy !== null || !activated}
