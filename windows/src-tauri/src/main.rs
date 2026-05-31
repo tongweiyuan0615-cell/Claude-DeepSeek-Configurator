@@ -832,7 +832,9 @@ fn verify_claude() -> CommandResult {
 
     match command_output("cmd", &["/C", "claude", "--version"]) {
         Ok(output) => {
-            let result = verify_claude_version_result(output);
+            let channel = first_claude_on_windows_path()
+                .and_then(|path| managed_claude_channel_for_path(&path));
+            let result = verify_claude_version_result_for_channel(output, channel);
             if result.success {
                 return result;
             }
@@ -854,10 +856,23 @@ fn verify_claude() -> CommandResult {
 }
 
 fn verify_claude_version_result(output: String) -> CommandResult {
+    verify_claude_version_result_for_channel(output, None)
+}
+
+fn verify_claude_version_result_for_channel(
+    output: String,
+    channel: Option<&'static str>,
+) -> CommandResult {
     if is_compatible_claude_version(&output) {
         CommandResult {
             success: true,
-            message: "Claude Code 可执行且版本兼容".to_string(),
+            message: "Claude Code 可执行且稳定版兼容".to_string(),
+            output: Some(output),
+        }
+    } else if channel == Some("latest") {
+        CommandResult {
+            success: true,
+            message: "Claude Code 最新版可执行；这是实验通道，DeepSeek 兼容性以实际对话为准".to_string(),
             output: Some(output),
         }
     } else {

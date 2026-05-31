@@ -853,24 +853,46 @@ fn verify_claude() -> CommandResult {
     let path_entries = managed_tool_path_entries();
     prepend_process_path(&path_entries);
 
-    match command_output_from_candidates(&claude_candidates(), &["--version"]) {
-        Ok(output) => verify_claude_version_result(output),
+    let active_candidate = active_macos_claude_bin_dir().join("claude");
+    let active_channel = managed_claude_channel_for_path(&active_candidate);
+    match command_output_from_candidates(&[active_candidate], &["--version"]) {
+        Ok(output) => verify_claude_version_result_for_channel(output, active_channel),
         Err(candidate_error) => match command_output("/bin/zsh", &["-lc", "claude --version"]) {
-            Ok(output) => verify_claude_version_result(output),
-            Err(path_error) => CommandResult {
-                success: false,
-                message: "Claude Code 验证失败".to_string(),
-                output: Some(format!("{candidate_error}\n{path_error}")),
+            Ok(output) => {
+                let shell_channel = first_claude_from_login_shell()
+                    .and_then(|path| managed_claude_channel_for_path(&path));
+                verify_claude_version_result_for_channel(output, shell_channel)
+            }
+            Err(path_error) => match command_output_from_candidates(&claude_candidates(), &["--version"]) {
+                Ok(output) => verify_claude_version_result(output),
+                Err(fallback_error) => CommandResult {
+                    success: false,
+                    message: "Claude Code 验证失败".to_string(),
+                    output: Some(format!("{candidate_error}\n{path_error}\n{fallback_error}")),
+                },
             },
         },
     }
 }
 
 fn verify_claude_version_result(output: String) -> CommandResult {
+    verify_claude_version_result_for_channel(output, None)
+}
+
+fn verify_claude_version_result_for_channel(
+    output: String,
+    channel: Option<&'static str>,
+) -> CommandResult {
     if is_compatible_claude_version(&output) {
         CommandResult {
             success: true,
-            message: "Claude Code 可执行且版本兼容".to_string(),
+            message: "Claude Code 可执行且稳定版兼容".to_string(),
+            output: Some(output),
+        }
+    } else if channel == Some("latest") {
+        CommandResult {
+            success: true,
+            message: "Claude Code 最新版可执行；这是实验通道，DeepSeek 兼容性以实际对话为准".to_string(),
             output: Some(output),
         }
     } else {
