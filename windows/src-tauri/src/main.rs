@@ -594,6 +594,7 @@ fn install_claude_channel(
             if cleanup_incompatible {
                 remove_incompatible_claude_binaries(&mut log);
             }
+            remove_managed_powershell_launcher(&claude_prefix, &mut log);
             refresh_process_path_from_registry();
             prepend_process_path(&[claude_prefix.clone()]);
             match command_output_from_candidates(&claude_candidates_for_prefix(&claude_prefix), &["--version"]) {
@@ -1608,6 +1609,25 @@ fn claude_package_dirs() -> Vec<PathBuf> {
 
 fn claude_candidates_for_prefix(prefix: &PathBuf) -> Vec<PathBuf> {
     vec![prefix.join("claude.cmd"), prefix.join("claude.exe")]
+}
+
+fn remove_managed_powershell_launcher(prefix: &PathBuf, log: &mut Vec<String>) {
+    let path = prefix.join("claude.ps1");
+    if !path.exists() {
+        return;
+    }
+
+    match fs::remove_file(&path) {
+        Ok(()) => log.push(format!(
+            "已删除本软件管理目录中的 PowerShell 启动脚本，避免执行策略阻止：{}",
+            path.display()
+        )),
+        Err(error) => log.push(format!(
+            "删除本软件管理目录中的 PowerShell 启动脚本失败：{} ({})",
+            path.display(),
+            error
+        )),
+    }
 }
 
 #[cfg(not(windows))]
