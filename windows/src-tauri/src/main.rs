@@ -24,6 +24,7 @@ const CLAUDE_PACKAGE: &str = "@anthropic-ai/claude-code";
 const CLAUDE_AUTOUPDATER_ENV_VAR: &str = "DISABLE_AUTOUPDATER";
 const NODE_RUNTIME_VERSION: &str = "20.20.2";
 const MANAGED_DIR_NAME: &str = "ClaudeDeepSeekConfigurator";
+const CLAUDE_LATEST_DIR_NAME: &str = "claude-code-latest";
 
 #[derive(Serialize)]
 struct ToolCheck {
@@ -369,7 +370,12 @@ fn generate_diagnostic_report(app: tauri::AppHandle) -> CommandResult {
     lines.push("Managed paths:".to_string());
     add_path_report(&mut lines, "Managed base", managed_base_dir());
     add_path_report(&mut lines, "Managed Node", managed_node_dir());
-    add_path_report(&mut lines, "Managed Claude prefix", managed_claude_prefix_dir());
+    add_path_report(&mut lines, "Managed stable Claude prefix", managed_claude_prefix_dir());
+    add_path_report(
+        &mut lines,
+        "Managed latest Claude prefix",
+        managed_claude_latest_prefix_dir(),
+    );
     lines.push(String::new());
 
     lines.push("Tool checks:".to_string());
@@ -489,6 +495,24 @@ fn redact_sk_tokens(input: &str) -> String {
 }
 
 fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
+    install_claude_channel(
+        app,
+        managed_claude_prefix_dir(),
+        format!("{CLAUDE_PACKAGE}@{CLAUDE_COMPAT_VERSION}"),
+        format!("Claude Code {CLAUDE_COMPAT_VERSION} 稳定版"),
+        true,
+        true,
+    )
+}
+
+fn install_claude_channel(
+    app: &tauri::AppHandle,
+    claude_prefix: Result<PathBuf, String>,
+    package_spec: String,
+    channel_label: String,
+    require_compatible: bool,
+    cleanup_incompatible: bool,
+) -> CommandResult {
     if let Err(error) = ensure_windows() {
         return error;
     }
@@ -515,7 +539,7 @@ fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
         }
     };
 
-    let claude_prefix = match managed_claude_prefix_dir() {
+    let claude_prefix = match claude_prefix {
         Ok(path) => path,
         Err(error) => {
             return CommandResult {
@@ -555,7 +579,6 @@ fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
         prepend_process_path(&[claude_prefix.clone()]);
     }
 
-    let package_spec = format!("{CLAUDE_PACKAGE}@{CLAUDE_COMPAT_VERSION}");
     let prefix_arg = claude_prefix.to_string_lossy().to_string();
     let npm_program = npm_cmd.to_string_lossy().to_string();
     match command_output_with_timeout(
@@ -568,21 +591,35 @@ fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
                 log.push(format!("Claude Code 安装输出：\n{}", bounded_output(output)));
             }
 
-            remove_incompatible_claude_binaries(&mut log);
+            if cleanup_incompatible {
+                remove_incompatible_claude_binaries(&mut log);
+            }
             refresh_process_path_from_registry();
-            let check = check_managed_claude();
-            if check.installed && check.meets_requirement != Some(false) {
-                CommandResult {
-                    success: true,
-                    message: format!("Claude Code {CLAUDE_COMPAT_VERSION} 安装完成"),
-                    output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
+            prepend_process_path(&[claude_prefix.clone()]);
+            match command_output_from_candidates(&claude_candidates_for_prefix(&claude_prefix), &["--version"]) {
+                Ok(version) if !require_compatible || is_compatible_claude_version(&version) => {
+                    log.push(format!("{channel_label} 当前版本：{version}"));
+                    CommandResult {
+                        success: true,
+                        message: format!("{channel_label} 安装完成"),
+                        output: Some(log.join("\n\n")).filter(|value| !value.trim().is_empty()),
+                    }
                 }
-            } else {
-                CommandResult {
+                Ok(version) => CommandResult {
+                    success: false,
+                    message: "Claude Code 安装后版本验证失败".to_string(),
+                    output: Some(format!(
+                        "{}\n\n检测到版本：{}\n需要稳定兼容版本：{}",
+                        log.join("\n\n"),
+                        version,
+                        CLAUDE_COMPAT_VERSION
+                    )),
+                },
+                Err(error) => CommandResult {
                     success: false,
                     message: "Claude Code 安装后验证失败".to_string(),
-                    output: Some(format!("{}\n\n{}", log.join("\n\n"), check.message)),
-                }
+                    output: Some(format!("{}\n\n{}", log.join("\n\n"), error)),
+                },
             }
         }
         Err(error) => {
@@ -594,6 +631,53 @@ fn install_claude_native(app: &tauri::AppHandle) -> CommandResult {
             }
         }
     }
+}
+
+#[tauri::command]
+async fn install_latest_claude(app: tauri::AppHandle) -> CommandResult {
+    run_blocking(move || install_latest_claude_internal(&app)).await
+}
+
+fn install_latest_claude_internal(app: &tauri::AppHandle) -> CommandResult {
+    let mut result = install_claude_channel(
+        app,
+        managed_claude_latest_prefix_dir(),
+        format!("{CLAUDE_PACKAGE}@latest"),
+        "Claude Code 最新版".to_string(),
+        false,
+        false,
+    );
+
+    if result.success {
+        result.message = "最新版 Claude Code 已启用。若 DeepSeek 不兼容，可点击“回退稳定版”。".to_string();
+        let note = "注意：最新版属于实验通道，只切换本软件管理的 Claude 路径，不会删除用户自己安装的 Claude。";
+        result.output = Some(match result.output {
+            Some(output) if !output.trim().is_empty() => format!("{output}\n\n{note}"),
+            _ => note.to_string(),
+        });
+    }
+
+    result
+}
+
+#[tauri::command]
+async fn rollback_stable_claude(app: tauri::AppHandle) -> CommandResult {
+    run_blocking(move || rollback_stable_claude_internal(&app)).await
+}
+
+fn rollback_stable_claude_internal(app: &tauri::AppHandle) -> CommandResult {
+    let mut result = install_claude_native(app);
+
+    if result.success {
+        result.message = format!("已回退到稳定版 Claude Code {CLAUDE_COMPAT_VERSION}。请重新打开 PowerShell / CMD / VS Code 终端。");
+        let note = "已将稳定版路径重新放到用户 PATH 前面；最新版目录会保留，方便以后再次尝试。";
+        result.output = Some(match result.output {
+            Some(output) if !output.trim().is_empty() => format!("{output}\n\n{note}"),
+            _ => note.to_string(),
+        });
+    }
+
+    result
 }
 
 #[tauri::command]
@@ -871,6 +955,10 @@ fn one_click_uninstall_internal() -> CommandResult {
         }
     }
 
+    if let Ok(latest_prefix) = managed_claude_latest_prefix_dir() {
+        let _ = remove_user_path_entry(&latest_prefix);
+    }
+
     match command_output_with_timeout("npm.cmd", &["uninstall", "-g", CLAUDE_PACKAGE], Duration::from_secs(120)) {
         Ok(output) => {
             if !output.trim().is_empty() {
@@ -960,6 +1048,10 @@ fn managed_node_dir() -> Result<PathBuf, String> {
 
 fn managed_claude_prefix_dir() -> Result<PathBuf, String> {
     Ok(managed_base_dir()?.join("claude-code"))
+}
+
+fn managed_claude_latest_prefix_dir() -> Result<PathBuf, String> {
+    Ok(managed_base_dir()?.join(CLAUDE_LATEST_DIR_NAME))
 }
 
 fn managed_tool_path_entries() -> Vec<PathBuf> {
@@ -1127,13 +1219,15 @@ fn check_claude_path_priority() -> ToolCheck {
         };
     };
 
-    let managed = is_managed_claude_path(&path);
+    let managed_channel = managed_claude_channel_for_path(&path);
+    let managed = managed_channel.is_some();
     ToolCheck {
         installed: true,
         version: None,
         meets_requirement: Some(managed),
         message: if managed {
-            format!("当前终端会优先使用本软件管理的 Claude：{}", path.display())
+            let channel = managed_channel.unwrap_or("unknown");
+            format!("当前终端会优先使用本软件管理的 {channel} Claude：{}", path.display())
         } else {
             format!(
                 "当前终端优先命中其他 Claude：{}；一键部署会尝试把本软件管理路径放到最前面。",
@@ -1238,13 +1332,29 @@ fn expand_windows_env_vars(value: &str) -> String {
 }
 
 fn is_managed_claude_path(path: &PathBuf) -> bool {
+    managed_claude_channel_for_path(path).is_some()
+}
+
+fn managed_claude_channel_for_path(path: &PathBuf) -> Option<&'static str> {
     let Ok(prefix) = managed_claude_prefix_dir() else {
-        return false;
+        return None;
     };
 
     let path_text = normalize_path_text(&path.to_string_lossy());
     let prefix_text = normalize_path_text(&prefix.to_string_lossy());
-    path_text == prefix_text || path_text.starts_with(&(prefix_text + "\\"))
+    if path_text == prefix_text || path_text.starts_with(&(prefix_text + "\\")) {
+        return Some("stable");
+    }
+
+    let Ok(latest_prefix) = managed_claude_latest_prefix_dir() else {
+        return None;
+    };
+    let latest_prefix_text = normalize_path_text(&latest_prefix.to_string_lossy());
+    if path_text == latest_prefix_text || path_text.starts_with(&(latest_prefix_text + "\\")) {
+        return Some("latest");
+    }
+
+    None
 }
 
 fn normalize_path_text(value: &str) -> String {
@@ -1396,8 +1506,7 @@ fn managed_claude_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(prefix) = managed_claude_prefix_dir() {
-        candidates.push(prefix.join("claude.cmd"));
-        candidates.push(prefix.join("claude.exe"));
+        candidates.extend(claude_candidates_for_prefix(&prefix));
     }
 
     candidates
@@ -1411,6 +1520,10 @@ fn managed_claude_candidates() -> Vec<PathBuf> {
 #[cfg(windows)]
 fn claude_candidates() -> Vec<PathBuf> {
     let mut candidates = managed_claude_candidates();
+
+    if let Ok(prefix) = managed_claude_latest_prefix_dir() {
+        candidates.extend(claude_candidates_for_prefix(&prefix));
+    }
 
     if let Ok(appdata) = std::env::var("APPDATA") {
         let npm_dir = PathBuf::from(appdata).join("npm");
@@ -1437,14 +1550,26 @@ fn claude_candidates() -> Vec<PathBuf> {
 
 #[cfg(windows)]
 fn claude_removal_candidates() -> Vec<PathBuf> {
-    let mut candidates = claude_candidates();
+    let mut candidates = managed_claude_candidates();
 
     if let Ok(prefix) = managed_claude_prefix_dir() {
         candidates.push(prefix.join("claude.ps1"));
     }
 
     if let Ok(appdata) = std::env::var("APPDATA") {
+        let npm_dir = PathBuf::from(&appdata).join("npm");
+        candidates.push(npm_dir.join("claude.cmd"));
+        candidates.push(npm_dir.join("claude.exe"));
         candidates.push(PathBuf::from(appdata).join("npm").join("claude.ps1"));
+    }
+
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        candidates.push(PathBuf::from(userprofile).join(".local").join("bin").join("claude.exe"));
+    }
+
+    if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(&localappdata).join("Programs").join("Claude").join("claude.exe"));
+        candidates.push(PathBuf::from(localappdata).join("Claude").join("claude.exe"));
     }
 
     candidates
@@ -1479,6 +1604,10 @@ fn claude_package_dirs() -> Vec<PathBuf> {
     }
 
     candidates
+}
+
+fn claude_candidates_for_prefix(prefix: &PathBuf) -> Vec<PathBuf> {
+    vec![prefix.join("claude.cmd"), prefix.join("claude.exe")]
 }
 
 #[cfg(not(windows))]
@@ -1594,6 +1723,8 @@ fn main() {
             configure_deepseek,
             update_api_key,
             one_click_setup,
+            install_latest_claude,
+            rollback_stable_claude,
             verify_claude,
             one_click_uninstall
         ])

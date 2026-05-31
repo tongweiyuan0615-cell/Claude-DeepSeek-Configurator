@@ -51,6 +51,7 @@ node scripts/check-version-consistency.mjs
 
 - Confirm no API Key appears in logs, screenshots, or issue comments.
 - Confirm diagnostic reports redact the DeepSeek API Key and only show whether it is configured.
+- Confirm `尝试最新版` can install the latest Claude Code and `回退稳定版` returns to the pinned compatible version.
 - Confirm artifact names are clear.
 - Confirm only MSI is uploaded for Windows and only DMG is uploaded for macOS.
 - Update `CHANGELOG.md` if the release contains user-facing changes.

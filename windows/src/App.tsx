@@ -228,7 +228,21 @@ function App() {
               onClick={() => runAction("configure", "one_click_setup", { apiKey })}
               disabled={busy !== null || !canConfigure}
             >
-              {busy === "configure" ? "部署中" : "一键部署"}
+              {busy === "configure" ? "部署中" : "一键部署稳定版"}
+            </button>
+            <button
+              className="secondary-button"
+              onClick={() => runAction("latestClaude", "install_latest_claude")}
+              disabled={busy !== null || !activated}
+            >
+              {busy === "latestClaude" ? "安装中" : "尝试最新版"}
+            </button>
+            <button
+              className="secondary-button"
+              onClick={() => runAction("rollbackClaude", "rollback_stable_claude")}
+              disabled={busy !== null || !activated}
+            >
+              {busy === "rollbackClaude" ? "回退中" : "回退稳定版"}
             </button>
             <button
               className="secondary-button"

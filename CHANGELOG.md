@@ -4,6 +4,7 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Added experimental latest Claude Code installation and one-click rollback to the stable compatible version.
 - Added redacted diagnostic reports for Windows and macOS support.
 - Added CI version consistency checks across Windows and macOS manifests.
 - Aligned Windows package metadata with release version 0.2.0.

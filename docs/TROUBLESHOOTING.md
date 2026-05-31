@@ -8,6 +8,14 @@ The report is designed for support and must not contain the DeepSeek API Key. It
 
 Before sharing a report publicly, still review it for local usernames or private filesystem paths.
 
+## Latest Claude Code does not work with DeepSeek
+
+The default deployment button installs the stable DeepSeek-compatible Claude Code version.
+
+The `尝试最新版` button is experimental. It installs the latest Claude Code into a separate managed directory and switches this app's managed PATH priority to that version.
+
+If the latest version does not work with DeepSeek, use `回退稳定版` to switch back to the pinned compatible version. The rollback does not remove user-installed Node.js or user-installed Claude Code.
+
 ## macOS says the app is damaged or cannot be opened
 
 The current macOS build is unsigned. After copying the app to `/Applications`, run:
