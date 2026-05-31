@@ -251,22 +251,9 @@ fn check_npm(app: &tauri::AppHandle) -> ToolCheck {
 fn check_claude() -> ToolCheck {
     match command_output("cmd", &["/C", "claude", "--version"]) {
         Ok(version) => {
-            let path_check = claude_tool_check(version);
-            if path_check.meets_requirement != Some(false) {
-                return path_check;
-            }
-
-            match command_output_from_candidates(&claude_candidates(), &["--version"]) {
-                Ok(candidate_version) => {
-                    let candidate_check = claude_tool_check(candidate_version);
-                    if candidate_check.meets_requirement != Some(false) {
-                        candidate_check
-                    } else {
-                        path_check
-                    }
-                }
-                Err(_) => path_check,
-            }
+            let channel = first_claude_on_windows_path()
+                .and_then(|path| managed_claude_channel_for_path(&path));
+            claude_tool_check_for_channel(version, channel)
         }
         Err(path_error) => match command_output_from_candidates(&claude_candidates(), &["--version"]) {
             Ok(version) => claude_tool_check(version),
@@ -281,14 +268,23 @@ fn check_claude() -> ToolCheck {
 }
 
 fn claude_tool_check(version: String) -> ToolCheck {
+    claude_tool_check_for_channel(version, None)
+}
+
+fn claude_tool_check_for_channel(version: String, channel: Option<&'static str>) -> ToolCheck {
     let compatible = is_compatible_claude_version(&version);
+    let managed_latest = channel == Some("latest");
 
     ToolCheck {
         installed: true,
         version: Some(version.clone()),
-        meets_requirement: Some(compatible),
-        message: if compatible {
-            format!("已安装 {version}")
+        meets_requirement: Some(compatible || managed_latest),
+        message: if managed_latest && !compatible {
+            format!("已启用实验最新版 {version}；如 DeepSeek 不兼容，请点击回退稳定版")
+        } else if managed_latest {
+            format!("已启用实验最新版 {version}")
+        } else if compatible {
+            format!("已安装稳定兼容版 {version}")
         } else {
             format!("已安装 {version}，但 DeepSeek 当前兼容版本需要 {CLAUDE_COMPAT_VERSION}")
         },

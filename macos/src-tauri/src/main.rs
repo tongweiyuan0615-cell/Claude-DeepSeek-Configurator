@@ -257,29 +257,47 @@ fn check_claude() -> ToolCheck {
     let path_entries = managed_tool_path_entries();
     prepend_process_path(&path_entries);
 
-    match command_output_from_candidates(&claude_candidates(), &["--version"]) {
-        Ok(version) => claude_tool_check(version),
-        Err(candidate_error) => match command_output("/bin/zsh", &["-lc", "claude --version"]) {
-            Ok(version) => claude_tool_check(version),
-            Err(path_error) => ToolCheck {
-                installed: false,
-                version: None,
-                meets_requirement: Some(false),
-                message: format!("{candidate_error}\n{path_error}"),
+    let active_candidate = active_macos_claude_bin_dir().join("claude");
+    let active_channel = managed_claude_channel_for_path(&active_candidate);
+    match command_output_from_candidates(&[active_candidate], &["--version"]) {
+        Ok(version) => claude_tool_check_for_channel(version, active_channel),
+        Err(active_error) => match command_output("/bin/zsh", &["-lc", "claude --version"]) {
+            Ok(version) => {
+                let shell_channel = first_claude_from_login_shell()
+                    .and_then(|path| managed_claude_channel_for_path(&path));
+                claude_tool_check_for_channel(version, shell_channel)
+            }
+            Err(path_error) => match command_output_from_candidates(&claude_candidates(), &["--version"]) {
+                Ok(version) => claude_tool_check(version),
+                Err(candidate_error) => ToolCheck {
+                    installed: false,
+                    version: None,
+                    meets_requirement: Some(false),
+                    message: format!("{active_error}\n{path_error}\n{candidate_error}"),
+                },
             },
-        },
+        }
     }
 }
 
 fn claude_tool_check(version: String) -> ToolCheck {
+    claude_tool_check_for_channel(version, None)
+}
+
+fn claude_tool_check_for_channel(version: String, channel: Option<&'static str>) -> ToolCheck {
     let compatible = is_compatible_claude_version(&version);
+    let managed_latest = channel == Some("latest");
 
     ToolCheck {
         installed: true,
         version: Some(version.clone()),
-        meets_requirement: Some(compatible),
-        message: if compatible {
-            format!("已安装 {version}")
+        meets_requirement: Some(compatible || managed_latest),
+        message: if managed_latest && !compatible {
+            format!("已启用实验最新版 {version}；如 DeepSeek 不兼容，请点击回退稳定版")
+        } else if managed_latest {
+            format!("已启用实验最新版 {version}")
+        } else if compatible {
+            format!("已安装稳定兼容版 {version}")
         } else {
             format!("已安装 {version}，但 DeepSeek 当前兼容版本需要 {CLAUDE_COMPAT_VERSION}")
         },
