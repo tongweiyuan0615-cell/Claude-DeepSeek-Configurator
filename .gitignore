@@ -25,3 +25,8 @@ macos/src-tauri/resources/node/*
 *.tar.gz
 .DS_Store
 Thumbs.db
+license_secret.txt
+license-server/node_modules
+license-server/.dev.vars
+license-server/.wrangler
+license-server/wrangler.toml
